@@ -1,5 +1,5 @@
 /**
- * hermes-relay.ts — OpenCode → WhatsApp relay plugin (Phase 3A)
+ * opencode-hermes-commands.ts — OpenCode → WhatsApp relay plugin (Phase 3A)
  *
  * Captures high-signal opencode events and routes them through two paths:
  *
@@ -39,7 +39,7 @@
  *   HERMES_WHATSAPP_CHAT_ID     default 248730783625457@lid (Ari)
  *   HERMES_RELAY_ENABLED        default "true"
  *   HERMES_RELAY_LOG_LEVEL      default "error"
- *   HERMES_RELAY_DB_PATH        default ~/.config/opencode/hermes-relay-state.db
+ *   HERMES_RELAY_DB_PATH        default ~/.hermes/plugins/opencode-hermes-commands/state.db
  *   HERMES_RELAY_MAX_QUEUE      default 100
  *   HERMES_RELAY_MAX_PER_HOUR  default 10
  *   HERMES_API_URL              default http://127.0.0.1:8642
@@ -65,7 +65,7 @@ const ENABLED = process.env.HERMES_RELAY_ENABLED !== "false";
 const LOG_LEVEL = process.env.HERMES_RELAY_LOG_LEVEL ?? "error";
 const DB_PATH =
   process.env.HERMES_RELAY_DB_PATH ??
-  `${process.env.HOME ?? "/root"}/.config/opencode/hermes-relay-state.db`;
+  `${process.env.HOME ?? "/root"}/.hermes/plugins/opencode-hermes-commands/state.db`;
 const MAX_QUEUE = parseInt(process.env.HERMES_RELAY_MAX_QUEUE ?? "100", 10);
 const MAX_PER_HOUR = parseInt(process.env.HERMES_RELAY_MAX_PER_HOUR ?? "10", 10);
 
@@ -216,16 +216,16 @@ function log(level: string, message: string): void {
   try {
     if (appLog) {
       void appLog({
-        body: { service: "hermes-relay", level, message },
+        body: { service: "opencode-hermes-commands", level, message },
       }).catch(() => {
         try {
-          console.error(`[hermes-relay] ${message}`);
+          console.error(`[opencode-hermes-commands] ${message}`);
         } catch {
           /* swallow */
         }
       });
     } else {
-      console.error(`[hermes-relay] ${message}`);
+      console.error(`[opencode-hermes-commands] ${message}`);
     }
   } catch {
     /* logging must never throw */
@@ -1397,7 +1397,7 @@ function startCommandDrainLoop(): void {
 // ── Plugin entrypoint (V1) ──────────────────────────────────────────────────
 
 export default {
-  id: "hermes-relay",
+  id: "opencode-hermes-commands",
   server: async (input: PluginInput): Promise<Hooks> => {
     try {
       appLog = input.client?.app?.log ?? null;

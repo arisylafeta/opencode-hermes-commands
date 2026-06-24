@@ -41,7 +41,7 @@ function loadConfig() {
 }
 function logPluginError(scope, error, detail = "") {
   try {
-    const path = process.env.HERMES_RELAY_ERROR_LOG ?? "/root/.config/opencode/hermes-relay-errors.log";
+    const path = process.env.HERMES_RELAY_ERROR_LOG ?? "/root/.hermes/plugins/opencode-hermes-commands/errors.log";
     const message = error instanceof Error ? `${error.name}: ${error.message}\n${error.stack ?? ""}` : String(error);
     appendFileSync(path, `[${new Date().toISOString()}] ${scope}${detail ? ` ${detail}` : ""}\n${message}\n\n`);
   } catch {}
@@ -731,7 +731,7 @@ class HermesRelayRuntime {
 
 // src/plugin.ts
 var plugin_default = {
-  id: "hermes-relay",
+  id: "opencode-hermes-commands",
   server: async (input) => {
     const config = loadConfig();
     if (!config.enabled) {
