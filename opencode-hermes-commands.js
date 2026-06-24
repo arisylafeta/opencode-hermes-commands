@@ -1,7 +1,7 @@
 // @bun
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { Database } from "bun:sqlite";
 
 const DB_PATH = process.env.HERMES_RELAY_DB_PATH ??
   `${process.env.HOME ?? "/root"}/.hermes/plugins/opencode-hermes-commands/state.db`;
@@ -19,9 +19,9 @@ function initStore() {
   try {
     const dir = path.dirname(DB_PATH);
     mkdirSync(dir, { recursive: true });
-    db = new DatabaseSync(DB_PATH);
-    db.exec("PRAGMA journal_mode = WAL;");
-    db.exec(`
+    db = new Database(DB_PATH);
+    db.run("PRAGMA journal_mode = WAL;");
+    db.run(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
         short_id INTEGER UNIQUE NOT NULL,
@@ -66,7 +66,7 @@ function initStore() {
     try {
       db.prepare("SELECT target_kind FROM commands LIMIT 0").all();
     } catch {
-      db.exec("ALTER TABLE commands ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'correlation'");
+      db.run("ALTER TABLE commands ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'correlation'");
     }
   } catch (err) {
     logPluginError("initStore", err);
