@@ -1,5 +1,305 @@
 // @bun
-import { appendFileSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const DB_PATH = process.env.HERMES_RELAY_DB_PATH ??
+  `${process.env.HOME ?? "/root"}/.hermes/plugins/opencode-hermes-commands/state.db`;
+
+let pluginClient = null;
+let pluginDirectory = "";
+let db = null;
+let commandDrainTimer = null;
+let commandDraining = false;
+const COMMAND_DRAIN_INTERVAL_MS = 5000;
+const COMMAND_TTL_MS = 300_000;
+
+function initStore() {
+  if (db) return;
+  try {
+    const dir = path.dirname(DB_PATH);
+    mkdirSync(dir, { recursive: true });
+    db = new DatabaseSync(DB_PATH);
+    db.exec("PRAGMA journal_mode = WAL;");
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        short_id INTEGER UNIQUE NOT NULL,
+        directory TEXT NOT NULL,
+        title TEXT,
+        status TEXT,
+        parent_id TEXT,
+        is_child INTEGER NOT NULL DEFAULT 0,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        last_assistant_text TEXT,
+        last_activity_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_sessions_short_id ON sessions(short_id);
+      CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(deleted, is_child, last_activity_at);
+
+      CREATE TABLE IF NOT EXISTS commands (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_kind TEXT NOT NULL DEFAULT 'correlation',
+        token TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        claimed_at INTEGER,
+        result TEXT,
+        expires_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands(status, target_kind, token);
+
+      CREATE TABLE IF NOT EXISTS correlations (
+        token TEXT PRIMARY KEY,
+        opencode_session_id TEXT NOT NULL,
+        directory TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        request_id TEXT,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
+    `);
+    try {
+      db.prepare("SELECT target_kind FROM commands LIMIT 0").all();
+    } catch {
+      db.exec("ALTER TABLE commands ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'correlation'");
+    }
+  } catch (err) {
+    logPluginError("initStore", err);
+    throw err;
+  }
+}
+
+function ensureDbSession(sessionId, directory, title, status, isChild, parentId) {
+  if (!db || !directory) return;
+  const now = Date.now();
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO sessions (session_id, short_id, directory, title, status, is_child, parent_id, created_at, updated_at, last_activity_at)
+      VALUES (?, (SELECT COALESCE(MAX(short_id), 0) + 1 FROM sessions), ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        directory = EXCLUDED.directory,
+        title = COALESCE(EXCLUDED.title, sessions.title),
+        status = COALESCE(EXCLUDED.status, sessions.status),
+        is_child = EXCLUDED.is_child,
+        parent_id = COALESCE(EXCLUDED.parent_id, sessions.parent_id),
+        updated_at = EXCLUDED.updated_at,
+        last_activity_at = EXCLUDED.last_activity_at
+    `);
+    stmt.run(sessionId, directory, title ?? null, status ?? "unknown", isChild ? 1 : 0, parentId ?? null, now, now, now);
+  } catch (err) {
+    logPluginError("ensureDbSession", err);
+  }
+}
+
+function updateDbSessionTitleStatus(sessionId, title, status) {
+  if (!db) return;
+  const now = Date.now();
+  try {
+    const stmt = db.prepare(`
+      UPDATE sessions SET
+        title = COALESCE(?, title),
+        status = COALESCE(?, status),
+        updated_at = ?,
+        last_activity_at = ?
+      WHERE session_id = ?
+    `);
+    stmt.run(title ?? null, status ?? null, now, now, sessionId);
+  } catch (err) {
+    logPluginError("updateDbSessionTitleStatus", err);
+  }
+}
+
+function updateDbSessionStatus(sessionId, status) {
+  if (!db) return;
+  const now = Date.now();
+  try {
+    const stmt = db.prepare(`
+      UPDATE sessions SET status = ?, updated_at = ?, last_activity_at = ? WHERE session_id = ?
+    `);
+    stmt.run(status, now, now, sessionId);
+  } catch (err) {
+    logPluginError("updateDbSessionStatus", err);
+  }
+}
+
+function updateDbLastAssistantText(sessionId, text) {
+  if (!db) return;
+  const now = Date.now();
+  try {
+    const stmt = db.prepare(`
+      UPDATE sessions SET last_assistant_text = ?, last_activity_at = ?, updated_at = ? WHERE session_id = ?
+    `);
+    stmt.run(text, now, now, sessionId);
+  } catch (err) {
+    logPluginError("updateDbLastAssistantText", err);
+  }
+}
+
+function markDbSessionDeleted(sessionId) {
+  if (!db) return;
+  const now = Date.now();
+  try {
+    const stmt = db.prepare(`UPDATE sessions SET deleted = 1, updated_at = ?, last_activity_at = ? WHERE session_id = ?`);
+    stmt.run(now, now, sessionId);
+  } catch (err) {
+    logPluginError("markDbSessionDeleted", err);
+  }
+}
+
+function getDbShortId(sessionId) {
+  if (!db) return;
+  try {
+    const row = db.prepare(`SELECT short_id FROM sessions WHERE session_id = ?`).get(sessionId);
+    return row?.short_id;
+  } catch (err) {
+    logPluginError("getDbShortId", err);
+  }
+}
+
+function startCommandDrainLoop() {
+  if (commandDrainTimer) return;
+  commandDrainTimer = setInterval(async () => {
+    if (commandDraining) return;
+    commandDraining = true;
+    try {
+      await commandDrainOnce();
+    } catch (err) {
+      logPluginError("commandDrain", err);
+    } finally {
+      commandDraining = false;
+    }
+  }, COMMAND_DRAIN_INTERVAL_MS);
+  if (commandDrainTimer && typeof commandDrainTimer.unref === "function") {
+    commandDrainTimer.unref();
+  }
+}
+
+async function commandDrainOnce() {
+  if (!db || !pluginClient) return;
+  const now = Date.now();
+  let command;
+  try {
+    const claim = db.prepare(`
+      UPDATE commands SET status = 'claimed', claimed_at = ?
+      WHERE id = (
+        SELECT c.id FROM commands c
+        LEFT JOIN sessions s ON c.target_kind = 'session' AND s.short_id = CAST(c.token AS INTEGER)
+        LEFT JOIN correlations corr ON c.target_kind = 'correlation' AND c.token = corr.token
+        WHERE c.status = 'pending' AND c.expires_at > ?
+          AND (
+            (c.target_kind = 'session' AND s.directory = ?)
+            OR (c.target_kind = 'correlation' AND corr.directory = ?)
+          )
+        ORDER BY c.id ASC
+        LIMIT 1
+      )
+      RETURNING *
+    `);
+    command = claim.get(now, now, pluginDirectory, pluginDirectory);
+  } catch (err) {
+    logPluginError("commandClaim", err);
+    return;
+  }
+  if (!command) return;
+
+  let targetId = null;
+  try {
+    if (command.target_kind === "session") {
+      const row = db.prepare(`SELECT session_id FROM sessions WHERE short_id = ? AND directory = ?`).get(command.token, pluginDirectory);
+      targetId = row?.session_id ?? null;
+    } else {
+      const row = db.prepare(`SELECT opencode_session_id FROM correlations WHERE token = ? AND directory = ?`).get(command.token, pluginDirectory);
+      targetId = row?.opencode_session_id ?? null;
+    }
+  } catch (err) {
+    logPluginError("commandResolve", err);
+    await markCommandStatus(command.id, "failed", String(err));
+    return;
+  }
+
+  if (!targetId) {
+    await markCommandStatus(command.id, "failed", "target not found");
+    return;
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(command.payload ?? "{}");
+  } catch {
+    payload = {};
+  }
+
+  let result;
+  let failed = false;
+  try {
+    switch (command.action) {
+      case "approve": {
+        await pluginClient.permission.reply({ requestID: payload.requestID, reply: "once" });
+        break;
+      }
+      case "reject": {
+        await pluginClient.permission.reply({ requestID: payload.requestID, reply: "reject", message: payload.message });
+        break;
+      }
+      case "answer": {
+        await pluginClient.question.reply({ requestID: payload.requestID, answers: [[payload.answer]] });
+        break;
+      }
+      case "continue":
+      case "say": {
+        await pluginClient.session.prompt({ sessionID: targetId, parts: [{ type: "text", text: payload.message }] });
+        break;
+      }
+      case "show": {
+        const messages = await pluginClient.session.messages({ sessionID: targetId });
+        result = extractLastAssistantText(messages);
+        break;
+      }
+      case "skip": {
+        break;
+      }
+      default: {
+        failed = true;
+        result = `unknown action ${command.action}`;
+      }
+    }
+  } catch (err) {
+    failed = true;
+    result = err instanceof Error ? err.message : String(err);
+  }
+
+  await markCommandStatus(command.id, failed ? "failed" : "done", result !== undefined ? JSON.stringify(result) : undefined);
+}
+
+async function markCommandStatus(id, status, result) {
+  if (!db) return;
+  try {
+    db.prepare(`UPDATE commands SET status = ?, result = ? WHERE id = ?`).run(status, result ?? null, id);
+  } catch (err) {
+    logPluginError("markCommandStatus", err);
+  }
+}
+
+function extractLastAssistantText(messages) {
+  if (!Array.isArray(messages)) return;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "assistant") continue;
+    const parts = Array.isArray(msg.parts) ? msg.parts : [];
+    for (let j = parts.length - 1; j >= 0; j--) {
+      const part = parts[j];
+      if (part?.type === "text" && typeof part.text === "string") {
+        return part.text;
+      }
+    }
+  }
+}
+
 // src/config.ts
 function parseBool(value, defaultValue) {
   if (value === undefined)
@@ -203,6 +503,7 @@ function getStatusType(props) {
 
 class SessionTracker {
   sessions = new Map;
+  messageRoles = new Map;
   ensureState(sessionId) {
     let state = this.sessions.get(sessionId);
     if (!state) {
@@ -214,6 +515,7 @@ class SessionTracker {
         lastActivityAt: Date.now(),
         lastUserMessageAt: 0,
         lastAssistantMessageAt: 0,
+        lastAssistantText: "",
         pendingPermission: false,
         pendingQuestion: false,
         deleted: false,
@@ -243,6 +545,7 @@ class SessionTracker {
             state.title = title;
           }
           state.lastActivityAt = Date.now();
+          ensureDbSession(sessionId, pluginDirectory, state.title, state.status, state.isChild, parentId);
           break;
         }
         case "session.status": {
@@ -257,6 +560,7 @@ class SessionTracker {
             state.doneNotifiedAt = 0;
           }
           state.lastActivityAt = Date.now();
+          updateDbSessionStatus(sessionId, state.status);
           if (state.status === "busy" && state.parentId) {
             const parent = this.sessions.get(state.parentId);
             if (parent) {
@@ -277,11 +581,16 @@ class SessionTracker {
             }
             this.sessions.delete(sessionId);
           }
+          markDbSessionDeleted(sessionId);
           break;
         }
         case "message.updated": {
           const state = this.ensureState(sessionId);
           const role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
+          const messageId = getStringProp(props, "id") ?? getNestedStringProp(props, "info", "id");
+          if (messageId && role) {
+            this.messageRoles.set(messageId, role);
+          }
           if (role === "user") {
             state.lastUserMessageAt = Date.now();
             state.lastActivityAt = Date.now();
@@ -291,12 +600,21 @@ class SessionTracker {
         }
         case "message.part.updated": {
           const state = this.ensureState(sessionId);
-          const role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
+          const messageId = getStringProp(props, "messageID") ?? getNestedStringProp(props, "part", "messageID");
+          let role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
+          if (!role && messageId) {
+            role = this.messageRoles.get(messageId);
+          }
           const partType = getStringProp(props, "partType") ?? getStringProp(props, "type") ?? getNestedStringProp(props, "part", "type");
           if (role === "assistant" && partType === "text") {
             state.lastAssistantMessageAt = Date.now();
             state.lastActivityAt = Date.now();
             state.doneNotifiedAt = 0;
+            const text = getStringProp(props, "text") ?? getNestedStringProp(props, "part", "text");
+            if (text) {
+              state.lastAssistantText = text;
+              updateDbLastAssistantText(sessionId, text);
+            }
           }
           break;
         }
@@ -453,7 +771,9 @@ class SessionTracker {
       const props = event.properties ?? {};
       const sessionId = getStringProp(props, "sessionID") ?? event.id;
       const state = this.getState(sessionId);
-      const title = state?.title ?? sessionId;
+      const baseTitle = state?.title ?? sessionId;
+      const shortId = getDbShortId(sessionId);
+      const title = shortId !== undefined ? `#${shortId} ${baseTitle}` : baseTitle;
       switch (event.type) {
         case "session.error": {
           const error = props.error;
@@ -509,11 +829,14 @@ class SessionTracker {
       const state = this.getState(sessionId);
       if (!state)
         return;
+      const baseTitle = state.title ?? sessionId;
+      const shortId = getDbShortId(sessionId);
+      const title = shortId !== undefined ? `#${shortId} ${baseTitle}` : baseTitle;
       return {
         id: `${sessionId}-done-${Date.now()}`,
         type: "done",
         sessionId,
-        title: state.title ?? sessionId,
+        title,
         message: "Session completed",
         timestamp: Date.now()
       };
@@ -737,6 +1060,10 @@ var plugin_default = {
     if (!config.enabled) {
       return {};
     }
+    pluginClient = input.client;
+    pluginDirectory = input.directory;
+    initStore();
+    startCommandDrainLoop();
     const runtime = new HermesRelayRuntime(config);
     runtime.start();
     return {
