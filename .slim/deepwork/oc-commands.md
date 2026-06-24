@@ -121,3 +121,29 @@ Key decisions from oracle:
 - Short IDs persist across restarts: YES (SQLite autoincrement)
 - `/oc show`: show full last assistant message (truncated to 1200 chars max)
 - Child/subagent sessions: hidden from `/oc list` by default
+
+## Implementation Results
+
+### Phase 2a: JS plugin (commit fcf1d26)
+- Added `node:sqlite` DatabaseSync with WAL mode
+- Sessions table with autoincrement short_id (persists across restarts)
+- Commands table with target_kind column for both correlation and session targets
+- Correlations table preserved for old approve/reject/answer compatibility
+- Store input.client reference (pluginClient) for SDK calls
+- Ported message role tracking (messageRoles map) from TS source
+- Persist session.created/updated/status/deleted and assistant text to SQLite
+- WhatsApp notifications now show #short_id in title (buildNotification, buildDoneNotification)
+- Command drain loop (5s) with atomic claim, session/correlation target resolution
+- Supports: approve, reject, answer, continue, say, show, skip actions
+- Syntax verified: `node --check` passed
+
+### Phase 2b: Bridge script (commit c528334)
+- Fixed DB path to ~/.hermes/plugins/opencode-hermes-commands/state.db
+- Added sessions table + target_kind migration to ensure_tables()
+- /oc list: human-readable, supports --json flag
+- /oc show <id>: displays title, status, last_assistant_text (truncated 1200 chars)
+- /oc <id> <prompt>: queues command with target_kind='session', action='continue'
+- /oc status <id>: command status check
+- All existing commands unchanged
+- Bridge script now versioned in plugin repo at opencode_bridge.py
+- Syntax verified: `python3 -m py_compile` passed
