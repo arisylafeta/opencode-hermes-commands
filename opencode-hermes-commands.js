@@ -75,24 +75,26 @@ function initStore() {
 }
 
 function ensureDbSession(sessionId, directory, title, status, isChild, parentId) {
-  if (!db || !directory) return;
+  const db2 = getDb();
+  if (!db2 || !directory) return;
   const now = Date.now();
-  try {
-    const stmt = db.prepare(`
-      INSERT INTO sessions (session_id, short_id, directory, title, status, is_child, parent_id, created_at, updated_at, last_activity_at)
-      VALUES (?, (SELECT COALESCE(MAX(short_id), 0) + 1 FROM sessions), ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(session_id) DO UPDATE SET
-        directory = EXCLUDED.directory,
-        title = COALESCE(EXCLUDED.title, sessions.title),
-        status = COALESCE(EXCLUDED.status, sessions.status),
-        is_child = EXCLUDED.is_child,
-        parent_id = COALESCE(EXCLUDED.parent_id, sessions.parent_id),
-        updated_at = EXCLUDED.updated_at,
-        last_activity_at = EXCLUDED.last_activity_at
-    `);
-    stmt.run(sessionId, directory, title ?? null, status ?? "unknown", isChild ? 1 : 0, parentId ?? null, now, now, now);
-  } catch (err) {
-    logPluginError("ensureDbSession", err);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      db2.prepare(
+        `INSERT OR IGNORE INTO sessions
+         (session_id, short_id, directory, title, status, is_child, parent_id, created_at, updated_at, last_activity_at)
+         VALUES (?, (SELECT COALESCE(MAX(short_id), 0) + 1 FROM sessions), ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(sessionId, directory, title ?? null, status ?? "unknown", isChild ? 1 : 0, parentId ?? null, now, now, now);
+      db2.prepare(
+        `UPDATE sessions SET directory = ?, title = COALESCE(?, title), status = COALESCE(?, status),
+         is_child = ?, parent_id = COALESCE(?, parent_id),
+         updated_at = ?, last_activity_at = ? WHERE session_id = ?`
+      ).run(directory, title ?? null, status ?? null, isChild ? 1 : 0, parentId ?? null, now, now, sessionId);
+      return;
+    } catch (err) {
+      if (attempt < 2) continue;
+      logPluginError("ensureDbSession", err);
+    }
   }
 }
 
@@ -161,6 +163,30 @@ function getDbShortId(sessionId) {
   }
 }
 
+function getDb() {
+  return db;
+}
+
+function shortId(id) {
+  if (typeof id !== "string") return String(id);
+  return id.length > 12 ? id.slice(0, 12) : id;
+}
+
+function createCorrelation(token, sessionId, directory, eventType, requestId) {
+  try {
+    const db2 = getDb();
+    if (!db2) return;
+    const now = Date.now();
+    db2.prepare(
+      `INSERT OR IGNORE INTO correlations
+       (token, opencode_session_id, directory, event_type, request_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(token, sessionId, directory, eventType, requestId ?? null, now, now + COMMAND_TTL_MS);
+  } catch (err) {
+    logPluginError("createCorrelation", err);
+  }
+}
+
 function startCommandDrainLoop() {
   if (commandDrainTimer) return;
   commandDrainTimer = setInterval(async () => {
@@ -182,6 +208,19 @@ function startCommandDrainLoop() {
 async function commandDrainOnce() {
   if (!db || !pluginClient) return;
   const now = Date.now();
+
+  // Recover stale claims and mark expired pending commands.
+  try {
+    db.prepare(
+      "UPDATE commands SET status = 'pending', claimed_at = NULL WHERE status = 'claimed' AND claimed_at < ?"
+    ).run(now - 60_000);
+    db.prepare(
+      "UPDATE commands SET status = 'expired' WHERE status = 'pending' AND expires_at < ?"
+    ).run(now);
+  } catch (err) {
+    logPluginError("commandStaleCleanup", err);
+  }
+
   let command;
   try {
     const claim = db.prepare(`
@@ -208,13 +247,15 @@ async function commandDrainOnce() {
   if (!command) return;
 
   let targetId = null;
+  let requestId = null;
   try {
     if (command.target_kind === "session") {
       const row = db.prepare(`SELECT session_id FROM sessions WHERE short_id = ? AND directory = ?`).get(command.token, pluginDirectory);
       targetId = row?.session_id ?? null;
     } else {
-      const row = db.prepare(`SELECT opencode_session_id FROM correlations WHERE token = ? AND directory = ?`).get(command.token, pluginDirectory);
+      const row = db.prepare(`SELECT opencode_session_id, request_id FROM correlations WHERE token = ? AND directory = ?`).get(command.token, pluginDirectory);
       targetId = row?.opencode_session_id ?? null;
+      requestId = row?.request_id ?? null;
     }
   } catch (err) {
     logPluginError("commandResolve", err);
@@ -239,25 +280,20 @@ async function commandDrainOnce() {
   try {
     switch (command.action) {
       case "approve": {
-        await pluginClient.permission.reply({ requestID: payload.requestID, reply: "once" });
+        await pluginClient.permission.reply({ requestID: requestId, reply: "once" });
         break;
       }
       case "reject": {
-        await pluginClient.permission.reply({ requestID: payload.requestID, reply: "reject", message: payload.message });
+        await pluginClient.permission.reply({ requestID: requestId, reply: "reject", message: payload.message });
         break;
       }
       case "answer": {
-        await pluginClient.question.reply({ requestID: payload.requestID, answers: [[payload.answer]] });
+        await pluginClient.question.reply({ requestID: requestId, answers: [[payload.answer]] });
         break;
       }
       case "continue":
       case "say": {
         await pluginClient.session.prompt({ sessionID: targetId, parts: [{ type: "text", text: payload.message }] });
-        break;
-      }
-      case "show": {
-        const messages = await pluginClient.session.messages({ sessionID: targetId });
-        result = extractLastAssistantText(messages);
         break;
       }
       case "skip": {
@@ -943,6 +979,10 @@ class HermesRelayRuntime {
       }
       this.sessionTracker.trackEvent(event);
       if (this.sessionTracker.shouldNotifyImmediate(event)) {
+        const immediateEventType = event.type;
+        if ((immediateEventType === "permission.asked" || immediateEventType === "question.asked") && props.id) {
+          createCorrelation(shortId(event.id), sessionId, pluginDirectory, immediateEventType, props.id);
+        }
         const notification = this.sessionTracker.buildNotification(event);
         if (notification) {
           this.scheduler.enqueue(notification);

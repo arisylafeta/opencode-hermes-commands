@@ -65,8 +65,8 @@ Usage:
   opencode_bridge.py /oc show <id>
       Show the latest assistant message for a session.
 
-  opencode_bridge.py /oc status <command_id>
-      Check the status of a session command.
+  opencode_bridge.py   /oc status <short_id>
+      Check the status of the latest command queued for session #<short_id>.
 
   opencode_bridge.py /oc <id> <prompt>
       Send a prompt to an opencode session by short ID.
@@ -282,13 +282,32 @@ def create_session_command(conn: sqlite3.Connection, short_id: int, message: str
     """Write a session command to the commands table."""
     now = int(time.time() * 1000)
     token = str(short_id)
+    target_kind = "session"
+
+    # Check if there's already a pending command for this session.
+    existing = conn.execute(
+        "SELECT id FROM commands WHERE token = ? AND target_kind = ? AND status = 'pending'",
+        (token, target_kind),
+    ).fetchone()
+    if existing:
+        print(
+            json.dumps(
+                {
+                    "error": f"command already pending for session #{short_id}",
+                    "command_id": existing["id"],
+                    "ok": False,
+                }
+            )
+        )
+        return 1
 
     conn.execute(
         """
         INSERT INTO commands (target_kind, token, action, payload, created_at, status, expires_at)
-        VALUES ('session', ?, 'continue', ?, ?, 'pending', ?)
+        VALUES (?, ?, 'continue', ?, ?, 'pending', ?)
         """,
         (
+            target_kind,
             token,
             json.dumps({"message": message}),
             now,
@@ -344,11 +363,11 @@ def create_command(
         return 1
 
     if action == "skip":
-        params = (token, action, json.dumps(payload), now, now + COMMAND_TTL_SECONDS * 1000)
+        params = ("correlation", token, action, json.dumps(payload), now, now + COMMAND_TTL_SECONDS * 1000)
         conn.execute(
             """
-            INSERT INTO commands (token, action, payload, created_at, status, expires_at)
-            VALUES (?, ?, ?, ?, 'done', ?)
+            INSERT INTO commands (target_kind, token, action, payload, created_at, status, expires_at)
+            VALUES (?, ?, ?, ?, ?, 'done', ?)
             """,
             params,
         )
@@ -390,9 +409,10 @@ def create_command(
         return 1
 
     # Check if there's already a pending command for this token.
+    target_kind = "correlation"
     existing = conn.execute(
-        "SELECT id FROM commands WHERE token = ? AND status = 'pending'",
-        (token,),
+        "SELECT id FROM commands WHERE token = ? AND target_kind = ? AND status = 'pending'",
+        (token, target_kind),
     ).fetchone()
     if existing:
         print(
@@ -408,10 +428,11 @@ def create_command(
 
     conn.execute(
         """
-        INSERT INTO commands (token, action, payload, created_at, status, expires_at)
-        VALUES (?, ?, ?, ?, 'pending', ?)
+        INSERT INTO commands (target_kind, token, action, payload, created_at, status, expires_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?)
         """,
         (
+            target_kind,
             token,
             action,
             json.dumps(payload),
@@ -468,18 +489,30 @@ def cmd_continue(conn: sqlite3.Connection, token: str, message: str) -> int:
     return create_command(conn, token, "continue", {"message": message})
 
 
-def cmd_status(conn: sqlite3.Connection, token: str) -> int:
+def cmd_status(conn: sqlite3.Connection, token: str, target_kind: str | None = None) -> int:
     """Check the status of the latest command for a token."""
-    row = conn.execute(
-        """
-        SELECT id, action, status, result, created_at, claimed_at
-        FROM commands
-        WHERE token = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (token,),
-    ).fetchone()
+    if target_kind is None:
+        row = conn.execute(
+            """
+            SELECT id, action, status, result, created_at, claimed_at
+            FROM commands
+            WHERE token = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (token,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """
+            SELECT id, action, status, result, created_at, claimed_at
+            FROM commands
+            WHERE token = ? AND target_kind = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (token, target_kind),
+        ).fetchone()
 
     if not row:
         print(json.dumps({"token": token, "status": "no_command", "ok": False}))
@@ -581,9 +614,9 @@ def main() -> int:
             elif subcommand == "status":
                 # Show command status for a session command
                 if len(sys.argv) < 4:
-                    print(json.dumps({"error": "usage: /oc status <command_id>", "ok": False}))
+                    print(json.dumps({"error": "usage: /oc status <short_id>", "ok": False}))
                     return 1
-                return cmd_status(conn, sys.argv[3])
+                return cmd_status(conn, sys.argv[3], target_kind="session")
 
             else:
                 # Treat as: /oc <id> <prompt>
