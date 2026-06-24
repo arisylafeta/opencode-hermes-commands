@@ -122,6 +122,21 @@ Key decisions from oracle:
 - `/oc show`: show full last assistant message (truncated to 1200 chars max)
 - Child/subagent sessions: hidden from `/oc list` by default
 
+## Root Cause of "Unrecognized slash command /oc" Error
+
+Hermes has its own plugin system for WhatsApp slash commands. The gateway intercepts messages starting with `/` and routes them to registered plugin handlers. `/oc` was never registered with Hermes, so the gateway rejected it as unknown.
+
+The fix: created a **Hermes plugin** (Python) at `~/.hermes/plugins/hermes-commands/` that:
+1. Has a `register(ctx)` function in `__init__.py` that calls `ctx.register_command(name="oc", ...)`
+2. Handler routes `/oc` subcommands to `opencode_bridge.py` via subprocess
+3. Enabled via `hermes plugins enable hermes-commands`
+
+This is separate from the **OpenCode plugin** (JS) that polls SQLite and executes commands. The full flow is:
+
+```
+WhatsApp /oc list → Hermes gateway → hermes-commands plugin → opencode_bridge.py → SQLite DB → opencode-hermes-commands.js plugin → OpenCode SDK
+```
+
 ## Implementation Results
 
 ### Phase 2a: JS plugin (commit fcf1d26)
