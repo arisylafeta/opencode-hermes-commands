@@ -147,3 +147,15 @@ Key decisions from oracle:
 - All existing commands unchanged
 - Bridge script now versioned in plugin repo at opencode_bridge.py
 - Syntax verified: `python3 -m py_compile` passed
+
+### Phase 3: Oracle review fixes (commit 08e08ee)
+- Added createCorrelation() for permission.asked/question.asked events (old /ok /no /say now work)
+- Fixed command execution to use correlation's request_id instead of payload.requestID
+- Added stale-claim recovery (claimed > 60s → back to pending)
+- Added expired pending command cleanup
+- Removed dead 'show' action from executeCommand
+- Added short_id allocation retry on UNIQUE constraint conflict
+- Fixed bridge duplicate pending check to include target_kind
+- Fixed /oc status to filter by target_kind='session'
+- Fixed /oc status docstring
+- Both files syntax-verified
