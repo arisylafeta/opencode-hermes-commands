@@ -1,0 +1,11 @@
+# SQLite state (runtime, not versioned)
+state.db
+state.db-shm
+state.db-wal
+
+# Dependencies
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
