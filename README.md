@@ -113,7 +113,7 @@ opencode-hermes-commands/
 
 ### Shared SQLite database
 
-`state.db` is the relay/control-plane database, not the source of truth for OpenCode session state. It stores stable short IDs, notification/answer correlation tokens, and queued commands. OpenCode's own database (`~/.local/share/opencode/opencode.db`) is the source of truth for sessions, messages, and active question tool parts. Commands such as `/oc questions`, `/oc list`, and `/oc show` read OpenCode DB directly and use `state.db` only to attach tokens/queue replies.
+`state.db` is the relay/control-plane database, not the source of truth for OpenCode session state. It stores stable short IDs, notification/answer correlation tokens, and queued commands. OpenCode's own database (`~/.local/share/opencode/opencode.db`) is the source of truth for sessions, messages, and active question tool parts. Commands such as `/oc questions`, `/oc list`, and `/oc show` read OpenCode DB directly and use `state.db` only to attach tokens/queue replies. Questions can be answered with either the token or the session short id, for example `/oc answer 60 Just the hero`.
 
 ## Configuration
 

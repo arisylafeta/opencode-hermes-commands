@@ -115,7 +115,7 @@ def format_oc_help() -> str:
             "",
             "❓ Questions / approvals",
             "• /oc questions",
-            "• /oc answer <token> <answer>",
+            "• /oc answer <id|token> <answer>",
             "• /oc ok <token>",
             "• /oc no <token> [reason]",
             "",
@@ -238,28 +238,43 @@ def details_from_question_part(part_data: dict) -> dict:
 
 
 def active_opencode_questions() -> list[dict]:
-    """Return running OpenCode question tool parts from the real OpenCode DB."""
+    """Return running OpenCode question tool parts from the real OpenCode DB.
+
+    Avoid whole-DB JSON LIKE scans. OpenCode has an index on part.session_id, so
+    scan recent sessions first, then inspect recent parts for each session.
+    """
     oc = open_opencode_db()
     if not oc:
         return []
     try:
-        rows = oc.execute(
+        sessions = oc.execute(
             """
-            SELECT p.id AS part_id, p.message_id, p.session_id, p.time_created, p.time_updated,
-                   p.data, s.title, s.directory, s.time_updated AS session_updated
-            FROM part p
-            JOIN session s ON s.id = p.session_id
-            WHERE p.data LIKE '%question%'
-              AND (s.time_archived IS NULL OR s.time_archived = 0)
-            ORDER BY p.time_updated DESC
-            LIMIT 500
+            SELECT id, title, directory, time_updated AS session_updated
+            FROM session
+            WHERE (time_archived IS NULL OR time_archived = 0)
+            ORDER BY time_updated DESC
+            LIMIT 100
             """
         ).fetchall()
+        rows = []
+        for s in sessions:
+            parts = oc.execute(
+                """
+                SELECT id AS part_id, message_id, session_id, time_created, time_updated, data
+                FROM part
+                WHERE session_id = ?
+                ORDER BY time_updated DESC
+                LIMIT 300
+                """,
+                (s["id"],),
+            ).fetchall()
+            for p in parts:
+                rows.append((s, p))
     finally:
         oc.close()
 
     questions: list[dict] = []
-    for row in rows:
+    for session_row, row in rows:
         data = json_loads_maybe(row["data"])
         if data.get("type") != "tool" or data.get("tool") != "question":
             continue
@@ -274,14 +289,14 @@ def active_opencode_questions() -> list[dict]:
         questions.append(
             {
                 "session_id": row["session_id"],
-                "title": row["title"],
-                "directory": row["directory"],
+                "title": session_row["title"],
+                "directory": session_row["directory"],
                 "part_id": row["part_id"],
                 "message_id": row["message_id"],
                 "call_id": data.get("callID"),
                 "time_created": row["time_created"],
                 "time_updated": row["time_updated"],
-                "session_updated": row["session_updated"],
+                "session_updated": session_row["session_updated"],
                 "details": details,
             }
         )
@@ -449,11 +464,10 @@ def latest_assistant_text_from_opencode(session_id: str) -> str | None:
     try:
         rows = oc.execute(
             """
-            SELECT p.data
-            FROM part p
-            JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
-            WHERE p.session_id = ?
-            ORDER BY p.time_created DESC
+            SELECT data
+            FROM part
+            WHERE session_id = ?
+            ORDER BY time_updated DESC
             LIMIT 200
             """,
             (session_id,),
@@ -764,7 +778,7 @@ def cmd_oc_questions(conn: sqlite3.Connection) -> int:
             print()
             print(message)
         print()
-        print(f"Reply: /oc answer {token} <answer>")
+        print(f"Reply: /oc answer {q.get('short_id') or token} <answer>  (or token: {token})")
         print(format_separator())
     return 0
 
@@ -841,7 +855,7 @@ def cmd_oc_show(conn: sqlite3.Connection, session_id: str) -> int:
             token = q.get("token") or "(no token)"
             print(f"Token: {token}")
             print(get_question_message(q.get("details") or {}))
-            print(f"Reply: /oc answer {token} <answer>")
+            print(f"Reply: /oc answer {short_id} <answer>  (or token: {token})")
             if not q.get("request_id"):
                 print("⚠️ This token has no request_id; answering may not work until the live event token is captured.")
             print(format_separator())
@@ -1228,8 +1242,59 @@ def cmd_reject(conn: sqlite3.Connection, token: str, message: str = "") -> int:
     return create_command(conn, token, "reject", {"reply": "reject", "message": message})
 
 
+def resolve_question_answer_target(conn: sqlite3.Connection, target: str) -> tuple[str | None, str | None]:
+    """Resolve /oc answer target.
+
+    Supports either the original correlation token or a session identifier:
+    short numeric id (e.g. 60) or full OpenCode session id. Session-id answers
+    only work when that session has exactly one active question.
+    """
+    sync_active_questions(conn)
+
+    token_row = conn.execute(
+        "SELECT token FROM correlations WHERE token = ? AND event_type IN ('question.asked', 'question.v2.asked')",
+        (target,),
+    ).fetchone()
+    if token_row:
+        return str(token_row["token"]), None
+
+    session_row = None
+    if target.isdigit():
+        session_row = resolve_session_by_short_id(conn, int(target))
+    elif target.startswith("ses_"):
+        session_row = conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ? AND deleted = 0",
+            (target,),
+        ).fetchone()
+        if not session_row:
+            # Seed the relay alias table from OpenCode DB if needed.
+            sync_recent_sessions(conn, 100)
+            session_row = conn.execute(
+                "SELECT * FROM sessions WHERE session_id = ? AND deleted = 0",
+                (target,),
+            ).fetchone()
+
+    if not session_row:
+        return None, f"no question token or session found for '{target}'"
+
+    questions = active_questions_for_session(conn, session_row["session_id"])
+    if not questions:
+        return None, f"session #{session_row['short_id']} has no active OpenCode question"
+    if len(questions) > 1:
+        tokens = [str(q.get("token")) for q in questions if q.get("token")]
+        return None, f"session #{session_row['short_id']} has {len(questions)} active questions; use one token: {', '.join(tokens)}"
+    token = questions[0].get("token")
+    if not token:
+        return None, f"session #{session_row['short_id']} has an active question but no answer token"
+    return str(token), None
+
+
 def cmd_answer(conn: sqlite3.Connection, token: str, answer: str) -> int:
-    return create_command(conn, token, "answer", {"answer": answer})
+    resolved_token, error = resolve_question_answer_target(conn, token)
+    if error or not resolved_token:
+        print(json.dumps({"error": error or f"could not resolve '{token}'", "ok": False}))
+        return 1
+    return create_command(conn, resolved_token, "answer", {"answer": answer})
 
 
 def cmd_continue(conn: sqlite3.Connection, token: str, message: str) -> int:
@@ -1351,7 +1416,7 @@ def main() -> int:
 
             elif subcommand == "answer":
                 if len(sys.argv) < 5:
-                    print(json.dumps({"error": "usage: /oc answer <token> <answer>", "ok": False}))
+                    print(json.dumps({"error": "usage: /oc answer <id|token> <answer>", "ok": False}))
                     return 1
                 answer = " ".join(sys.argv[4:])
                 return cmd_answer(conn, sys.argv[3], answer)
@@ -1429,7 +1494,7 @@ def main() -> int:
 
         elif action == "answer":
             if len(sys.argv) < 4:
-                print(json.dumps({"error": "usage: answer <token> <answer>", "ok": False}))
+                print(json.dumps({"error": "usage: answer <id|token> <answer>", "ok": False}))
                 return 1
             answer = " ".join(sys.argv[3:])
             return cmd_answer(conn, sys.argv[2], answer)
