@@ -9,7 +9,7 @@ Hermes calls this script via the terminal tool to:
   - Continue or dismiss sessions
   - List and interact with opencode sessions via short IDs
 
-This script also understands WhatsApp-style slash replies:
+This script also understands slash-command replies:
   /ok <token>
   /no <token> [reason]
   /say <token> <message>
@@ -275,7 +275,9 @@ def parse_kill_ids(argv: list[str]) -> tuple[list[int], str | None]:
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=3)
+    db_path = Path(DB_PATH).expanduser()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path), timeout=3)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 3000")
@@ -927,19 +929,6 @@ def main() -> int:
         return 1
 
     action = sys.argv[1]
-
-    if not os.path.exists(DB_PATH):
-        print(
-            json.dumps(
-                {
-                    "error": f"database not found at {DB_PATH}",
-                    "hint": "the opencode plugin creates this on first run. "
-                    "Start an opencode session with the hermes-relay plugin loaded.",
-                    "ok": False,
-                }
-            )
-        )
-        return 1
 
     conn = get_db()
     ensure_tables(conn)
