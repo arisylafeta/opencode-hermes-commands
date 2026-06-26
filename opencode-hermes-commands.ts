@@ -139,6 +139,10 @@ interface PluginInput {
         sessionID: string;
         parts: Array<{ type: string; text: string }>;
       }) => Promise<unknown>;
+      promptAsync?: (params: {
+        sessionID: string;
+        parts: Array<{ type: string; text: string }>;
+      }) => Promise<unknown>;
     };
     permission?: {
       reply?: (params: {
@@ -194,7 +198,7 @@ let appLog:
 
 // Phase 3B: stored client reference for command execution (approve/reject/
 // answer/continue). Set in the entrypoint before the command drain loop starts.
-let pluginClient: PluginInput["client"] = null;
+let pluginClient: PluginInput["client"] | null = null;
 
 // Session title tracking. Populated from session.created/session.updated events.
 // Used to include a human-readable name in WhatsApp notifications.
@@ -1310,14 +1314,21 @@ async function executeCommand(
 
       case "continue":
       case "say": {
-        if (!pluginClient?.session?.prompt) {
-          return { ok: false, result: "session.prompt not available" };
+        if (!pluginClient?.session?.promptAsync && !pluginClient?.session?.prompt) {
+          return { ok: false, result: "session.promptAsync not available" };
         }
         const message = payload.message || "";
-        await pluginClient.session.prompt({
-          sessionID: sessionId,
-          parts: [{ type: "text", text: message }],
-        });
+        if (pluginClient.session.promptAsync) {
+          await pluginClient.session.promptAsync({
+            sessionID: sessionId,
+            parts: [{ type: "text", text: message }],
+          });
+        } else {
+          await pluginClient.session.prompt!({
+            sessionID: sessionId,
+            parts: [{ type: "text", text: message }],
+          });
+        }
         return { ok: true, result: `session continued with: ${message}` };
       }
 

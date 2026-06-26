@@ -76,7 +76,9 @@ Database: ~/.hermes/plugins/opencode-hermes-commands/state.db (shared with the p
 
 import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -87,6 +89,191 @@ DB_PATH = os.environ.get(
 )
 
 COMMAND_TTL_SECONDS = 300  # commands expire after 5 minutes
+SYSTEM_COMMAND_TOKEN = "__global__"
+
+
+def format_separator() -> str:
+    return "━━━━━━━━━━"
+
+
+def format_oc_help() -> str:
+    return "\n".join(
+        [
+            "🤖 OpenCode controls",
+            format_separator(),
+            "📂 Sessions",
+            "• /oc list",
+            "• /oc show <id>",
+            "• /oc reply <id> <message>",
+            "• /oc <id> <message>",
+            "• /oc kill <id> [id...]",
+            "• /oc status <id>",
+            "",
+            "✨ New session",
+            "• /oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>",
+            "",
+            "💬 Examples",
+            "• /oc 21 continue from the last failing test",
+            "• /oc reply 21 keep going, focus on the auth bug",
+            "• /oc kill 21 24 28",
+            "• /oc new --preset cheap-flex audit this repo for dead code",
+            "• /oc new --agent fixer --dir projects/rebattery-enrich add a healthcheck endpoint",
+        ]
+    )
+
+
+def compact_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def format_relative_age(timestamp_ms: int | None) -> str:
+    if not timestamp_ms:
+        return "unknown"
+    seconds = max(0, int(time.time()) - int(timestamp_ms // 1000))
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h {minutes % 60}m ago"
+    days = hours // 24
+    return f"{days}d {hours % 24}h ago"
+
+
+def format_status_badge(status: str | None) -> str:
+    value = (status or "unknown").lower()
+    if value == "busy":
+        return "🟡 busy"
+    if value == "idle":
+        return "🟢 idle"
+    return f"⚪ {value}"
+
+
+def format_command_status_badge(status: str | None) -> str:
+    value = (status or "unknown").lower()
+    if value == "done":
+        return "✅ done"
+    if value == "pending":
+        return "🕓 pending"
+    if value == "claimed":
+        return "🏃 claimed"
+    if value == "failed":
+        return "❌ failed"
+    if value == "expired":
+        return "⌛ expired"
+    return f"⚪ {value}"
+
+
+def parse_new_command_args(argv: list[str]) -> tuple[dict, str | None]:
+    opts: dict[str, str | None] = {
+        "agent": None,
+        "model": None,
+        "preset": None,
+        "dir": None,
+    }
+    prompt_parts: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token in {"--agent", "--model", "--preset", "--dir"}:
+            if i + 1 >= len(argv):
+                return {}, f"missing value for {token}"
+            opts[token[2:]] = argv[i + 1]
+            i += 2
+            continue
+        prompt_parts = argv[i:]
+        break
+
+    prompt = compact_whitespace(" ".join(prompt_parts))
+    if not prompt:
+        return {}, "missing prompt"
+    return opts, prompt
+
+
+def infer_default_directory(conn: sqlite3.Connection) -> str:
+    row = conn.execute(
+        """
+        SELECT directory
+        FROM sessions
+        WHERE deleted = 0
+        ORDER BY last_activity_at DESC, updated_at DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    if row and row["directory"]:
+        return str(row["directory"])
+    return os.getcwd()
+
+
+def launch_opencode_run(
+    *,
+    directory: str,
+    message: str,
+    session_id: str | None = None,
+    agent: str | None = None,
+    model: str | None = None,
+    preset: str | None = None,
+    title: str | None = None,
+) -> tuple[int | None, str | None]:
+    target_dir = str(Path(directory).expanduser())
+    if not Path(target_dir).exists():
+        return None, f"directory not found: {target_dir}"
+
+    final_message = message
+    if preset:
+        final_message = f"/preset {preset}\n{message}"
+
+    args = ["opencode", "run", "--dir", target_dir]
+    if session_id:
+        args.extend(["--session", session_id])
+    elif title:
+        args.extend(["--title", title])
+
+    if agent:
+        args.extend(["--agent", agent])
+    if model:
+        args.extend(["--model", model])
+
+    args.append(final_message)
+
+    try:
+        child = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ},
+        )
+        return child.pid, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def parse_kill_ids(argv: list[str]) -> tuple[list[int], str | None]:
+    tokens: list[str] = []
+    for arg in argv:
+        pieces = [piece.strip() for piece in arg.split(",")]
+        tokens.extend(piece for piece in pieces if piece)
+
+    if not tokens:
+        return [], "missing session ids"
+
+    ids: list[int] = []
+    invalid: list[str] = []
+    for token in tokens:
+        try:
+            ids.append(int(token))
+        except ValueError:
+            invalid.append(token)
+
+    if invalid:
+        return [], f"invalid session id(s): {', '.join(invalid)}"
+
+    deduped = list(dict.fromkeys(ids))
+    return deduped, None
 
 
 def get_db() -> sqlite3.Connection:
@@ -230,14 +417,20 @@ def cmd_oc_list(conn: sqlite3.Connection) -> int:
         return 0
 
     if not rows:
-        print("No active opencode sessions.")
+        print("📭 No active OpenCode sessions.")
         return 0
 
-    print("opencode sessions:")
+    print(format_separator())
+    print(f"📋 OpenCode sessions ({len(rows)})")
+    print(format_separator())
     for r in rows:
         title = r["title"] or "untitled"
         directory_name = Path(r["directory"]).name if r["directory"] else "unknown"
-        print(f"  #{r['short_id']}  {r['status'] or 'unknown'}   {directory_name} — {title}")
+        print(f"#{r['short_id']}  {format_status_badge(r['status'])}")
+        print(f"Title: {title}")
+        print(f"Dir: {directory_name}")
+        print(f"Last active: {format_relative_age(r['last_activity_at'])}")
+        print(format_separator())
     return 0
 
 
@@ -268,13 +461,16 @@ def cmd_oc_show(conn: sqlite3.Connection, session_id: str) -> int:
         print(f"Session #{short_id} ({title}) has no assistant message yet.")
         return 0
 
-    if len(text) > 1200:
-        text = text[:1200] + "..."
-
-    print(f"opencode #{short_id} — {title}")
+    print(format_separator())
+    print(f"🤖 OpenCode session #{short_id}")
+    print(f"Title: {title}")
     print(f"Status: {row['status'] or 'unknown'}")
+    print(f"Session ID: {row['session_id']}")
+    print(format_separator())
     print()
     print(text)
+    print()
+    print(format_separator())
     return 0
 
 
@@ -318,6 +514,56 @@ def create_session_command(conn: sqlite3.Connection, short_id: int, message: str
     return 0
 
 
+def create_system_command(
+    conn: sqlite3.Connection, action: str, payload: dict, scope_token: str
+) -> int:
+    """Write a system-level command to the commands table."""
+    now = int(time.time() * 1000)
+
+    existing = conn.execute(
+        "SELECT id FROM commands WHERE token = ? AND target_kind = 'system' AND status = 'pending'",
+        (scope_token,),
+    ).fetchone()
+    if existing:
+        print(
+            json.dumps(
+                {
+                    "error": "a system command is already pending",
+                    "command_id": existing["id"],
+                    "ok": False,
+                }
+            )
+        )
+        return 1
+
+    conn.execute(
+        """
+        INSERT INTO commands (target_kind, token, action, payload, created_at, status, expires_at)
+        VALUES ('system', ?, ?, ?, ?, 'pending', ?)
+        """,
+        (
+            scope_token,
+            action,
+            json.dumps(payload),
+            now,
+            now + COMMAND_TTL_SECONDS * 1000,
+        ),
+    )
+    conn.commit()
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "token": scope_token,
+                "action": action,
+                "message": f"✨ Queued {action} for {scope_token}. OpenCode should pick it up in a few seconds.",
+            }
+        )
+    )
+    return 0
+
+
 def cmd_oc_prompt(conn: sqlite3.Connection, session_id: str, message: str) -> int:
     """Send a prompt to an opencode session by short ID."""
     try:
@@ -335,12 +581,115 @@ def cmd_oc_prompt(conn: sqlite3.Connection, session_id: str, message: str) -> in
         print(json.dumps({"error": f"No session #{short_id} found.", "ok": False}))
         return 1
 
-    create_session_command(conn, short_id, message)
+    pid, error = launch_opencode_run(
+        directory=row["directory"],
+        session_id=row["session_id"],
+        message=message,
+    )
+    if error:
+        print(json.dumps({"error": error, "ok": False}))
+        return 1
 
     print(
-        f"Queued prompt for session #{short_id}. The opencode plugin will execute it within a few seconds."
+        f"💬 Sent reply to session #{short_id}. OpenCode run started as PID {pid}."
     )
     return 0
+
+
+def cmd_oc_new(conn: sqlite3.Connection, argv: list[str]) -> int:
+    opts, prompt_or_error = parse_new_command_args(argv)
+    if not prompt_or_error:
+        print(json.dumps({"error": "missing prompt", "ok": False}))
+        return 1
+    if not opts and prompt_or_error.startswith("missing "):
+        print(
+            json.dumps(
+                {
+                    "error": f"usage: /oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt> ({prompt_or_error})",
+                    "ok": False,
+                }
+            )
+        )
+        return 1
+
+    target_dir = opts.get("dir") or infer_default_directory(conn)
+    title = compact_whitespace(prompt_or_error)[:60]
+    pid, error = launch_opencode_run(
+        directory=target_dir,
+        message=prompt_or_error,
+        agent=opts.get("agent"),
+        model=opts.get("model"),
+        preset=opts.get("preset"),
+        title=title,
+    )
+    if error:
+        print(json.dumps({"error": error, "ok": False}))
+        return 1
+
+    print(
+        f"✨ Started a new OpenCode run in {target_dir} as PID {pid}. It should appear in /oc list shortly."
+    )
+    return 0
+
+
+def cmd_oc_kill(conn: sqlite3.Connection, argv: list[str]) -> int:
+    ids, error = parse_kill_ids(argv)
+    if error:
+        print(json.dumps({"error": f"usage: /oc kill <id> [id...] ({error})", "ok": False}))
+        return 1
+
+    rows = conn.execute(
+        f"""
+        SELECT short_id, session_id, title, status
+               , directory
+        FROM sessions
+        WHERE deleted = 0 AND short_id IN ({','.join('?' for _ in ids)})
+        ORDER BY short_id ASC
+        """,
+        ids,
+    ).fetchall()
+
+    found_by_id = {int(row["short_id"]): row for row in rows}
+    missing = [str(short_id) for short_id in ids if short_id not in found_by_id]
+    if missing:
+        print(
+            json.dumps(
+                {
+                    "error": f"no active session(s) found for: {', '.join(missing)}",
+                    "ok": False,
+                }
+            )
+        )
+        return 1
+
+    sessions = [
+        {
+            "short_id": int(row["short_id"]),
+            "session_id": row["session_id"],
+            "title": row["title"],
+            "status": row["status"],
+        }
+        for row in rows
+    ]
+
+    session_directories = {str(row["directory"]) for row in rows}
+    if len(session_directories) != 1:
+        print(
+            json.dumps(
+                {
+                    "error": "kill only supports sessions from a single directory at a time",
+                    "ok": False,
+                }
+            )
+        )
+        return 1
+
+    return create_system_command(
+        conn,
+        "kill_sessions",
+        {"sessions": sessions},
+        next(iter(session_directories)),
+    )
 
 
 def create_command(
@@ -515,7 +864,7 @@ def cmd_status(conn: sqlite3.Connection, token: str, target_kind: str | None = N
         ).fetchone()
 
     if not row:
-        print(json.dumps({"token": token, "status": "no_command", "ok": False}))
+        print(f"📭 No command found for {token}.")
         return 0
 
     result = None
@@ -525,21 +874,24 @@ def cmd_status(conn: sqlite3.Connection, token: str, target_kind: str | None = N
         except Exception:
             result = row["result"]
 
-    print(
-        json.dumps(
-            {
-                "token": token,
-                "command_id": row["id"],
-                "action": row["action"],
-                "status": row["status"],
-                "result": result,
-                "created_at": row["created_at"],
-                "claimed_at": row["claimed_at"],
-                "ok": row["status"] == "done",
-            },
-            indent=2,
-        )
-    )
+    print(format_separator())
+    print(f"📡 Command status for {token}")
+    print(format_separator())
+    print(f"ID: {row['id']}")
+    print(f"Action: {row['action']}")
+    print(f"Status: {format_command_status_badge(row['status'])}")
+    print(f"Created: {format_relative_age(row['created_at'])}")
+    if row["claimed_at"]:
+        print(f"Claimed: {format_relative_age(row['claimed_at'])}")
+    if result is not None:
+        if isinstance(result, (dict, list)):
+            result_text = json.dumps(result, indent=2)
+        else:
+            result_text = str(result)
+        print()
+        print("Result:")
+        print(result_text)
+    print(format_separator())
     return 0
 
 
@@ -597,10 +949,14 @@ def main() -> int:
     try:
         if action == "/oc":
             if len(sys.argv) < 3:
-                print(json.dumps({"error": "usage: /oc list | /oc show <id> | /oc <id> <prompt>", "ok": False}))
+                print(json.dumps({"error": format_oc_help(), "ok": False}))
                 return 1
 
             subcommand = sys.argv[2]
+
+            if subcommand == "help":
+                print(format_oc_help())
+                return 0
 
             if subcommand == "list":
                 return cmd_oc_list(conn)
@@ -618,18 +974,43 @@ def main() -> int:
                     return 1
                 return cmd_status(conn, sys.argv[3], target_kind="session")
 
+            elif subcommand in {"reply", "say"}:
+                if len(sys.argv) < 5:
+                    print(json.dumps({"error": f"usage: /oc {subcommand} <id> <message>", "ok": False}))
+                    return 1
+                return cmd_oc_prompt(conn, sys.argv[3], " ".join(sys.argv[4:]))
+
+            elif subcommand == "kill":
+                if len(sys.argv) < 4:
+                    print(json.dumps({"error": "usage: /oc kill <id> [id...]", "ok": False}))
+                    return 1
+                return cmd_oc_kill(conn, sys.argv[3:])
+
+            elif subcommand == "new":
+                if len(sys.argv) < 4:
+                    print(
+                        json.dumps(
+                            {
+                                "error": "usage: /oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>",
+                                "ok": False,
+                            }
+                        )
+                    )
+                    return 1
+                return cmd_oc_new(conn, sys.argv[3:])
+
             else:
                 # Treat as: /oc <id> <prompt>
                 try:
                     session_id = int(subcommand)
                 except ValueError:
-                    print(json.dumps({"error": f"unknown /oc subcommand '{subcommand}'. Usage: /oc list | /oc show <id> | /oc <id> <prompt>", "ok": False}))
+                    print(json.dumps({"error": f"unknown /oc subcommand '{subcommand}'\n\n{format_oc_help()}", "ok": False}))
                     return 1
                 if len(sys.argv) < 4:
                     print(json.dumps({"error": f"usage: /oc {session_id} <prompt>", "ok": False}))
                     return 1
                 message = " ".join(sys.argv[3:])
-                return cmd_oc_prompt(conn, session_id, message)
+                return cmd_oc_prompt(conn, str(session_id), message)
 
         elif action == "pending":
             return cmd_pending(conn)

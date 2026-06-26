@@ -12,37 +12,55 @@ Usage:
 
 import logging
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-BRIDGE_SCRIPT = Path("/usr/local/bin/opencode_bridge.py")
+PLUGIN_DIR = Path(__file__).resolve().parent
+BRIDGE_CANDIDATES = [
+    PLUGIN_DIR / "opencode_bridge.py",
+    Path("/usr/local/bin/opencode_bridge.py"),
+]
 COMMAND_TIMEOUT = 15  # seconds
 
 
-def handle_oc(raw_args: str) -> str | None:
-    """Handle the /oc slash command.
+def resolve_bridge_script() -> Path | None:
+    for candidate in BRIDGE_CANDIDATES:
+        if candidate.exists():
+            return candidate
+    return None
 
-    Routes to opencode_bridge.py with /oc as the first argument, passing
-    the raw_args verbatim as additional arguments.
-    """
-    if not BRIDGE_SCRIPT.exists():
-        return "\u274c opencode_bridge.py not found at /usr/local/bin/"
+
+def handle_oc(raw_args: str) -> str | None:
+    """Handle the /oc slash command."""
+    bridge_script = resolve_bridge_script()
+    if bridge_script is None:
+        return "Bridge error: opencode_bridge.py not found"
 
     args = raw_args.strip().split() if raw_args.strip() else []
 
     if not args:
         return (
-            "\u2139\ufe0f Usage:\n"
-            "/oc list - List active sessions\n"
-            "/oc show <id> - Show last AI message\n"
-            "/oc <id> <prompt> - Send a prompt\n"
-            "/oc status <id> - Check command status"
+            "OC help\n"
+            "==========\n"
+            "/oc help\n"
+            "/oc list\n"
+            "/oc show <id>\n"
+            "/oc reply <id> <message>\n"
+            "/oc <id> <message>\n"
+            "/oc kill <id> [id...]\n"
+            "/oc status <id>\n"
+            "/oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>"
         )
 
-    cmd = ["python3", str(BRIDGE_SCRIPT), "/oc"] + args
+    try:
+        args = shlex.split(raw_args)
+    except ValueError as exc:
+        return f"Parse error: {exc}"
+
+    cmd = ["python3", str(bridge_script), "/oc", *args]
 
     try:
         result = subprocess.run(
@@ -53,26 +71,26 @@ def handle_oc(raw_args: str) -> str | None:
             env={**os.environ},
         )
     except subprocess.TimeoutExpired:
-        return "\u23f3 Command timed out"
+        return "Command timed out"
     except Exception as exc:
         logger.error("opencode_bridge.py execution failed: %s", exc)
-        return f"\u274c Bridge error: {exc}"
+        return f"Bridge error: {exc}"
 
     output = result.stdout.strip()
     if not output and result.stderr.strip():
         output = result.stderr.strip()
 
-    # If the bridge returned JSON, try to make it human-readable
     if output.startswith("{"):
         import json
+
         try:
             data = json.loads(output)
             if "error" in data:
-                return f"\u274c {data['error']}"
+                return f"Error: {data['error']}"
             if "message" in data:
-                return f"\u2705 {data['message']}"
+                return data["message"]
             return output
         except json.JSONDecodeError:
             pass
 
-    return output or "\u2705 Done"
+    return output or "Done"

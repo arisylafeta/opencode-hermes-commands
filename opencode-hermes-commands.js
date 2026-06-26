@@ -1,5 +1,6 @@
 // @bun
 import { appendFileSync, mkdirSync } from "node:fs";
+import { spawn } from "node:child_process";
 import path from "node:path";
 import { Database } from "bun:sqlite";
 
@@ -13,6 +14,7 @@ let commandDrainTimer = null;
 let commandDraining = false;
 const COMMAND_DRAIN_INTERVAL_MS = 5000;
 const COMMAND_TTL_MS = 300_000;
+const SYSTEM_COMMAND_TOKEN = "__global__";
 
 function initStore() {
   if (db) return;
@@ -21,6 +23,7 @@ function initStore() {
     mkdirSync(dir, { recursive: true });
     db = new Database(DB_PATH);
     db.run("PRAGMA journal_mode = WAL;");
+    db.run("PRAGMA busy_timeout = 3000;");
     db.run(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT PRIMARY KEY,
@@ -233,13 +236,14 @@ async function commandDrainOnce() {
           AND (
             (c.target_kind = 'session' AND s.directory = ?)
             OR (c.target_kind = 'correlation' AND corr.directory = ?)
+            OR (c.target_kind = 'system' AND (c.token = ? OR c.token = ?))
           )
         ORDER BY c.id ASC
         LIMIT 1
       )
       RETURNING *
     `);
-    command = claim.get(now, now, pluginDirectory, pluginDirectory);
+    command = claim.get(now, now, pluginDirectory, pluginDirectory, pluginDirectory, SYSTEM_COMMAND_TOKEN);
   } catch (err) {
     logPluginError("commandClaim", err);
     return;
@@ -252,6 +256,8 @@ async function commandDrainOnce() {
     if (command.target_kind === "session") {
       const row = db.prepare(`SELECT session_id FROM sessions WHERE short_id = ? AND directory = ?`).get(command.token, pluginDirectory);
       targetId = row?.session_id ?? null;
+    } else if (command.target_kind === "system") {
+      targetId = SYSTEM_COMMAND_TOKEN;
     } else {
       const row = db.prepare(`SELECT opencode_session_id, request_id FROM correlations WHERE token = ? AND directory = ?`).get(command.token, pluginDirectory);
       targetId = row?.opencode_session_id ?? null;
@@ -265,6 +271,11 @@ async function commandDrainOnce() {
 
   if (!targetId) {
     await markCommandStatus(command.id, "failed", "target not found");
+    return;
+  }
+
+  if (command.target_kind !== "system" && !await sessionOwnedByCurrentClient(targetId)) {
+    await releaseClaimedCommand(command.id);
     return;
   }
 
@@ -293,7 +304,25 @@ async function commandDrainOnce() {
       }
       case "continue":
       case "say": {
-        await pluginClient.session.prompt({ sessionID: targetId, parts: [{ type: "text", text: payload.message }] });
+        if (pluginClient.session.promptAsync) {
+          await pluginClient.session.promptAsync({ sessionID: targetId, parts: [{ type: "text", text: payload.message }] });
+        } else {
+          await pluginClient.session.prompt({ sessionID: targetId, parts: [{ type: "text", text: payload.message }] });
+        }
+        break;
+      }
+      case "new_session": {
+        result = await spawnNewSession(payload);
+        if (!result.ok) {
+          failed = true;
+        }
+        break;
+      }
+      case "kill_sessions": {
+        result = await killSessions(payload);
+        if (!result.ok) {
+          failed = true;
+        }
         break;
       }
       case "skip": {
@@ -319,6 +348,141 @@ async function markCommandStatus(id, status, result) {
   } catch (err) {
     logPluginError("markCommandStatus", err);
   }
+}
+async function releaseClaimedCommand(id) {
+  if (!db) return;
+  try {
+    db.prepare(`UPDATE commands SET status = 'pending', claimed_at = NULL WHERE id = ? AND status = 'claimed'`).run(id);
+  } catch (err) {
+    logPluginError("releaseClaimedCommand", err);
+  }
+}
+async function sessionOwnedByCurrentClient(sessionId) {
+  if (!pluginClient?.session?.get) {
+    return true;
+  }
+  try {
+    await pluginClient.session.get({ sessionID: sessionId });
+    return true;
+  } catch {
+    return false;
+  }
+}
+function safeSessionName(value) {
+  return String(value || "oc-session").toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "oc-session";
+}
+function buildSpawnInput(payload) {
+  const lines = [];
+  if (payload.preset) {
+    lines.push(`/preset ${payload.preset}`);
+  }
+  if (payload.prompt) {
+    lines.push(String(payload.prompt).trim());
+  }
+  return lines.join("\n") + "\n";
+}
+async function spawnNewSession(payload) {
+  const prompt = typeof payload?.prompt === "string" ? payload.prompt.trim() : "";
+  if (!prompt) {
+    return { ok: false, error: "missing prompt" };
+  }
+  const cwd = typeof payload?.dir === "string" && payload.dir.trim() ? payload.dir.trim() : pluginDirectory;
+  const args = ["run"];
+  if (typeof payload?.agent === "string" && payload.agent.trim()) {
+    args.push("--agent", payload.agent.trim());
+  }
+  if (typeof payload?.model === "string" && payload.model.trim()) {
+    args.push("--model", payload.model.trim());
+  }
+  const sessionName = `${safeSessionName(prompt.slice(0, 32))}-${Date.now().toString(36).slice(-6)}`;
+  args.push("--dir", cwd, "--title", sessionName);
+  if (payload?.preset) {
+    args.push("--command", `preset ${payload.preset}`);
+  }
+  args.push(prompt);
+  try {
+    const child = spawn("opencode", args, {
+      cwd,
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: true,
+      windowsHide: true,
+      env: { ...process.env }
+    });
+    child.unref();
+    return {
+      ok: true,
+      pid: child.pid,
+      session_name: sessionName,
+      cwd,
+      agent: payload?.agent || null,
+      model: payload?.model || null,
+      preset: payload?.preset || null
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+function runOpencodeCommand(args, cwd) {
+  return new Promise((resolve) => {
+    const child = spawn("opencode", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: { ...process.env }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", (error) => {
+      resolve({ ok: false, code: null, stdout, stderr, error: error instanceof Error ? error.message : String(error) });
+    });
+    child.on("close", (code) => {
+      resolve({ ok: code === 0, code, stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+  });
+}
+async function killSessions(payload) {
+  const requested = Array.isArray(payload?.sessions) ? payload.sessions : [];
+  if (!requested.length) {
+    return { ok: false, error: "missing sessions" };
+  }
+  const results = [];
+  let anyFailed = false;
+  for (const item of requested) {
+    const shortId = Number(item?.short_id);
+    const sessionId = typeof item?.session_id === "string" ? item.session_id : "";
+    if (!Number.isInteger(shortId) || !sessionId) {
+      results.push({ short_id: item?.short_id ?? null, ok: false, error: "invalid session payload" });
+      anyFailed = true;
+      continue;
+    }
+    const response = await runOpencodeCommand(["session", "delete", sessionId], pluginDirectory);
+    if (response.ok) {
+      try {
+        db?.prepare("UPDATE sessions SET deleted = 1, updated_at = ?, last_activity_at = ? WHERE session_id = ?").run(Date.now(), Date.now(), sessionId);
+      } catch (err) {
+        logPluginError("killSessions.markDeleted", err);
+      }
+      results.push({ short_id: shortId, session_id: sessionId, ok: true });
+      continue;
+    }
+    anyFailed = true;
+    results.push({
+      short_id: shortId,
+      session_id: sessionId,
+      ok: false,
+      error: response.stderr || response.stdout || response.error || `exit ${response.code}`
+    });
+  }
+  return { ok: !anyFailed, results };
 }
 
 function extractLastAssistantText(messages) {
@@ -540,6 +704,7 @@ function getStatusType(props) {
 class SessionTracker {
   sessions = new Map;
   messageRoles = new Map;
+  assistantMessageTexts = new Map;
   ensureState(sessionId) {
     let state = this.sessions.get(sessionId);
     if (!state) {
@@ -608,6 +773,9 @@ class SessionTracker {
         case "session.deleted": {
           const state = this.sessions.get(sessionId);
           if (state) {
+            if (state.lastAssistantMessageId) {
+              this.assistantMessageTexts.delete(state.lastAssistantMessageId);
+            }
             state.deleted = true;
             if (state.parentId) {
               const parent = this.sessions.get(state.parentId);
@@ -626,6 +794,11 @@ class SessionTracker {
           const messageId = getStringProp(props, "id") ?? getNestedStringProp(props, "info", "id");
           if (messageId && role) {
             this.messageRoles.set(messageId, role);
+            if (role === "assistant" && state.lastAssistantMessageId !== messageId) {
+              state.lastAssistantMessageId = messageId;
+              state.lastAssistantText = "";
+              this.assistantMessageTexts.set(messageId, "");
+            }
           }
           if (role === "user") {
             state.lastUserMessageAt = Date.now();
@@ -647,7 +820,23 @@ class SessionTracker {
             state.lastActivityAt = Date.now();
             state.doneNotifiedAt = 0;
             const text = getStringProp(props, "text") ?? getNestedStringProp(props, "part", "text");
-            if (text) {
+            if (text && messageId) {
+              const previousText = this.assistantMessageTexts.get(messageId) ?? "";
+              let nextText = text;
+              if (previousText) {
+                if (text.startsWith(previousText)) {
+                  nextText = text;
+                } else if (previousText.endsWith(text)) {
+                  nextText = previousText;
+                } else {
+                  nextText = `${previousText}${text}`;
+                }
+              }
+              this.assistantMessageTexts.set(messageId, nextText);
+              state.lastAssistantMessageId = messageId;
+              state.lastAssistantText = nextText;
+              updateDbLastAssistantText(sessionId, nextText);
+            } else if (text) {
               state.lastAssistantText = text;
               updateDbLastAssistantText(sessionId, text);
             }

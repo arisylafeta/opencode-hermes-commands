@@ -9,4 +9,5 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
-hermes-commands/__pycache__/
+__pycache__/
+errors.log
