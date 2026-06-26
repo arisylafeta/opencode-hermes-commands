@@ -62,6 +62,7 @@ function initStore() {
         directory TEXT NOT NULL,
         event_type TEXT NOT NULL,
         request_id TEXT,
+        details TEXT,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL
       );
@@ -70,6 +71,11 @@ function initStore() {
       db.prepare("SELECT target_kind FROM commands LIMIT 0").all();
     } catch {
       db.run("ALTER TABLE commands ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'correlation'");
+    }
+    try {
+      db.prepare("SELECT details FROM correlations LIMIT 0").all();
+    } catch {
+      db.run("ALTER TABLE correlations ADD COLUMN details TEXT");
     }
   } catch (err) {
     logPluginError("initStore", err);
@@ -175,16 +181,16 @@ function shortId(id) {
   return id.length > 12 ? id.slice(0, 12) : id;
 }
 
-function createCorrelation(token, sessionId, directory, eventType, requestId) {
+function createCorrelation(token, sessionId, directory, eventType, requestId, details) {
   try {
     const db2 = getDb();
     if (!db2) return;
     const now = Date.now();
     db2.prepare(
       `INSERT OR IGNORE INTO correlations
-       (token, opencode_session_id, directory, event_type, request_id, created_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
-    ).run(token, sessionId, directory, eventType, requestId ?? null, now, now + COMMAND_TTL_MS);
+       (token, opencode_session_id, directory, event_type, request_id, details, created_at, expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(token, sessionId, directory, eventType, requestId ?? null, details ? JSON.stringify(details) : null, now, now + COMMAND_TTL_MS);
   } catch (err) {
     logPluginError("createCorrelation", err);
   }
@@ -701,6 +707,42 @@ function getStatusType(props) {
   return getStringProp(props, "type") ?? getNestedStringProp(props, "status", "type");
 }
 
+function formatQuestionDetails(props) {
+  const questions = Array.isArray(props?.questions) ? props.questions : [];
+  if (!questions.length) {
+    return getStringProp(props, "message") ?? "Question asked";
+  }
+  const lines = [];
+  questions.forEach((q, index) => {
+    const header = typeof q?.header === "string" && q.header ? q.header : `Question ${index + 1}`;
+    const question = typeof q?.question === "string" ? q.question : "";
+    lines.push(`${index + 1}. ${header}`);
+    if (question) lines.push(question);
+    const options = Array.isArray(q?.options) ? q.options : [];
+    if (options.length) {
+      lines.push("Options:");
+      options.forEach((opt) => {
+        const label = typeof opt?.label === "string" ? opt.label : String(opt ?? "");
+        const desc = typeof opt?.description === "string" && opt.description ? ` - ${opt.description}` : "";
+        lines.push(`- ${label}${desc}`);
+      });
+    }
+    if (q?.multiple) lines.push("Multiple answers allowed.");
+    if (q?.custom) lines.push("Custom answer allowed.");
+    if (index < questions.length - 1) lines.push("");
+  });
+  return lines.join("\n");
+}
+
+function questionDetailsFromEvent(event) {
+  const props = event?.properties ?? {};
+  return {
+    message: formatQuestionDetails(props),
+    questions: Array.isArray(props.questions) ? props.questions : [],
+    tool: props.tool ?? null
+  };
+}
+
 class SessionTracker {
   sessions = new Map;
   messageRoles = new Map;
@@ -856,7 +898,8 @@ class SessionTracker {
           state.lastActivityAt = Date.now();
           break;
         }
-        case "question.asked": {
+        case "question.asked":
+        case "question.v2.asked": {
           const state = this.ensureState(sessionId);
           state.pendingQuestion = true;
           state.lastActivityAt = Date.now();
@@ -864,7 +907,9 @@ class SessionTracker {
           break;
         }
         case "question.replied":
-        case "question.rejected": {
+        case "question.rejected":
+        case "question.v2.replied":
+        case "question.v2.rejected": {
           const state = this.ensureState(sessionId);
           state.pendingQuestion = false;
           state.lastActivityAt = Date.now();
@@ -953,7 +998,7 @@ class SessionTracker {
     try {
       if (event.type === "permission.asked")
         return true;
-      if (event.type === "question.asked")
+      if (event.type === "question.asked" || event.type === "question.v2.asked")
         return true;
       if (event.type === "session.error") {
         const error = event.properties?.error;
@@ -1025,17 +1070,20 @@ class SessionTracker {
           return {
             id: `${event.id}-${Date.now()}`,
             type: "permission",
+            token: shortId(event.id),
             sessionId,
             title,
             message,
             timestamp: Date.now()
           };
         }
-        case "question.asked": {
-          const message = getStringProp(props, "message") ?? "Question asked";
+        case "question.asked":
+        case "question.v2.asked": {
+          const message = formatQuestionDetails(props);
           return {
             id: `${event.id}-${Date.now()}`,
             type: "question",
+            token: shortId(event.id),
             sessionId,
             title,
             message,
@@ -1084,14 +1132,18 @@ class WhatsAppNotifier {
         return `\uD83D\uDD34 opencode error
 *${title}*
 ${notification.message}`;
-      case "permission":
+      case "permission": {
+        const tokenLine = notification.token ? `\nReply: /oc ok ${notification.token} or /oc no ${notification.token} [reason]` : "";
         return `\uD83D\uDFE1 opencode needs approval
 *${title}*
-${notification.message}`;
-      case "question":
+${notification.message}${tokenLine}`;
+      }
+      case "question": {
+        const tokenLine = notification.token ? `\nReply: /oc answer ${notification.token} <answer>\nShow all: /oc questions` : "\nShow all: /oc questions";
         return `\u2753 opencode is asking
 *${title}*
-${notification.message}`;
+${notification.message}${tokenLine}`;
+      }
       case "done":
         return `\uD83D\uDFE2 opencode done
 *${title}*
@@ -1169,8 +1221,9 @@ class HermesRelayRuntime {
       this.sessionTracker.trackEvent(event);
       if (this.sessionTracker.shouldNotifyImmediate(event)) {
         const immediateEventType = event.type;
-        if ((immediateEventType === "permission.asked" || immediateEventType === "question.asked") && props.id) {
-          createCorrelation(shortId(event.id), sessionId, pluginDirectory, immediateEventType, props.id);
+        if ((immediateEventType === "permission.asked" || immediateEventType === "question.asked" || immediateEventType === "question.v2.asked") && props.id) {
+          const details = immediateEventType.startsWith("question") ? questionDetailsFromEvent(event) : undefined;
+          createCorrelation(shortId(event.id), sessionId, pluginDirectory, immediateEventType, props.id, details);
         }
         const notification = this.sessionTracker.buildNotification(event);
         if (notification) {
@@ -1200,7 +1253,8 @@ class HermesRelayRuntime {
           break;
         }
         case "permission.asked":
-        case "question.asked": {
+        case "question.asked":
+        case "question.v2.asked": {
           this.sessionTracker.resetDoneNotified(sessionId);
           break;
         }

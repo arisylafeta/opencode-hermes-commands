@@ -108,6 +108,12 @@ def format_oc_help() -> str:
             "• /oc kill <id> [id...]",
             "• /oc status <id>",
             "",
+            "❓ Questions / approvals",
+            "• /oc questions",
+            "• /oc answer <token> <answer>",
+            "• /oc ok <token>",
+            "• /oc no <token> [reason]",
+            "",
             "✨ New session",
             "• /oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>",
             "",
@@ -293,6 +299,7 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
             directory TEXT NOT NULL,
             event_type TEXT NOT NULL,
             request_id TEXT,
+            details TEXT,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL
         )
@@ -344,6 +351,12 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE commands ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'correlation'")
 
+    # Migration: add question/permission details to correlations if missing
+    try:
+        conn.execute("SELECT details FROM correlations LIMIT 0")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE correlations ADD COLUMN details TEXT")
+
     conn.commit()
 
 
@@ -352,7 +365,7 @@ def cmd_pending(conn: sqlite3.Connection) -> int:
     now = int(time.time() * 1000)
     rows = conn.execute(
         """
-        SELECT token, opencode_session_id, directory, event_type, request_id, created_at
+        SELECT token, opencode_session_id, directory, event_type, request_id, details, created_at
         FROM correlations
         WHERE expires_at > ?
         ORDER BY created_at DESC
@@ -374,6 +387,13 @@ def cmd_pending(conn: sqlite3.Connection) -> int:
         if existing:
             continue  # already has a pending command, skip
 
+        details = None
+        if r["details"]:
+            try:
+                details = json.loads(r["details"])
+            except Exception:
+                details = {"message": r["details"]}
+
         pending.append(
             {
                 "token": r["token"],
@@ -381,11 +401,63 @@ def cmd_pending(conn: sqlite3.Connection) -> int:
                 "directory": r["directory"],
                 "event_type": r["event_type"],
                 "request_id": r["request_id"],
+                "details": details,
                 "age_seconds": (now - r["created_at"]) // 1000,
             }
         )
 
     print(json.dumps({"pending": pending}, indent=2))
+    return 0
+
+
+def cmd_oc_questions(conn: sqlite3.Connection) -> int:
+    """Show active question prompts from OpenCode."""
+    now = int(time.time() * 1000)
+    rows = conn.execute(
+        """
+        SELECT token, opencode_session_id, directory, event_type, request_id, details, created_at
+        FROM correlations
+        WHERE expires_at > ? AND event_type IN ('question.asked', 'question.v2.asked')
+        ORDER BY created_at DESC
+        """,
+        (now,),
+    ).fetchall()
+
+    visible = []
+    for r in rows:
+        existing = conn.execute(
+            "SELECT 1 FROM commands WHERE token = ? AND target_kind = 'correlation' AND status = 'pending'",
+            (r["token"],),
+        ).fetchone()
+        if existing:
+            continue
+        details = None
+        if r["details"]:
+            try:
+                details = json.loads(r["details"])
+            except Exception:
+                details = {"message": r["details"]}
+        visible.append((r, details))
+
+    if not visible:
+        print("📭 No active OpenCode questions.")
+        return 0
+
+    print(format_separator())
+    print(f"❓ OpenCode questions ({len(visible)})")
+    print(format_separator())
+    for r, details in visible:
+        print(f"Token: {r['token']}")
+        print(f"Session: {r['opencode_session_id']}")
+        print(f"Dir: {Path(r['directory']).name if r['directory'] else 'unknown'}")
+        print(f"Age: {format_relative_age(r['created_at'])}")
+        message = details.get("message") if isinstance(details, dict) else None
+        if message:
+            print()
+            print(message)
+        print()
+        print(f"Reply: /oc answer {r['token']} <answer>")
+        print(format_separator())
     return 0
 
 
@@ -947,6 +1019,29 @@ def main() -> int:
 
             if subcommand == "list":
                 return cmd_oc_list(conn)
+
+            elif subcommand in {"questions", "pending"}:
+                return cmd_oc_questions(conn)
+
+            elif subcommand == "answer":
+                if len(sys.argv) < 5:
+                    print(json.dumps({"error": "usage: /oc answer <token> <answer>", "ok": False}))
+                    return 1
+                answer = " ".join(sys.argv[4:])
+                return cmd_answer(conn, sys.argv[3], answer)
+
+            elif subcommand in {"ok", "approve"}:
+                if len(sys.argv) < 4:
+                    print(json.dumps({"error": f"usage: /oc {subcommand} <token>", "ok": False}))
+                    return 1
+                return cmd_approve(conn, sys.argv[3])
+
+            elif subcommand in {"no", "reject"}:
+                if len(sys.argv) < 4:
+                    print(json.dumps({"error": f"usage: /oc {subcommand} <token> [reason]", "ok": False}))
+                    return 1
+                message = " ".join(sys.argv[4:]) if len(sys.argv) > 4 else ""
+                return cmd_reject(conn, sys.argv[3], message)
 
             elif subcommand == "show":
                 if len(sys.argv) < 4:

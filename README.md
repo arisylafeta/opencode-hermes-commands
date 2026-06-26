@@ -24,6 +24,10 @@ The Hermes gateway plugin registers the `/oc` slash command. When you send a mes
 | `/oc list` | List active OpenCode sessions |
 | `/oc show <id>` | Show the last assistant message for a session |
 | `/oc reply <id> <message>` | Send a message to an existing session |
+| `/oc questions` | Show active OpenCode question prompts with options and reply tokens |
+| `/oc answer <token> <answer>` | Answer a pending OpenCode question |
+| `/oc ok <token>` | Approve a pending OpenCode permission request |
+| `/oc no <token> [reason]` | Reject a pending OpenCode permission request |
 | `/oc new [options] <prompt>` | Start a new OpenCode session |
 | `/oc kill <id> [id...]` | Kill one or more sessions |
 | `/oc status <id>` | Check command status for a session |
@@ -43,6 +47,10 @@ The Hermes gateway plugin registers the `/oc` slash command. When you send a mes
 /oc list
 /oc show 31
 /oc reply 31 keep going, focus on the auth bug
+/oc questions
+/oc answer evt_f04230a4 Use the simpler option
+/oc ok evt_f04230a4
+/oc no evt_f04230a4 too risky
 /oc new audit this repo for dead code
 /oc new --agent fixer --dir projects/rebattery-enrich add a healthcheck endpoint
 /oc new --model anthropic/claude-sonnet-4-6 --preset cheap-flex review the auth flow
