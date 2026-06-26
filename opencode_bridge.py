@@ -87,8 +87,13 @@ DB_PATH = os.environ.get(
     "HERMES_RELAY_DB_PATH",
     str(Path.home() / ".hermes" / "plugins" / "opencode-hermes-commands" / "state.db"),
 )
+OPENCODE_DB_PATH = os.environ.get(
+    "OPENCODE_DB_PATH",
+    str(Path.home() / ".local" / "share" / "opencode" / "opencode.db"),
+)
 
 COMMAND_TTL_SECONDS = 300  # commands expire after 5 minutes
+QUESTION_CORRELATION_TTL_SECONDS = 24 * 60 * 60  # unanswered questions stay visible for a day
 SYSTEM_COMMAND_TOKEN = "__global__"
 
 
@@ -168,6 +173,305 @@ def format_command_status_badge(status: str | None) -> str:
     if value == "expired":
         return "⌛ expired"
     return f"⚪ {value}"
+
+
+def open_opencode_db() -> sqlite3.Connection | None:
+    """Open OpenCode's DB read-only. This DB is the source of truth."""
+    path = Path(OPENCODE_DB_PATH)
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def json_loads_maybe(value: str | None) -> dict:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_question_message(details: dict) -> str:
+    if details.get("message"):
+        return str(details["message"])
+    lines: list[str] = []
+    questions = details.get("questions") if isinstance(details.get("questions"), list) else []
+    for idx, q in enumerate(questions, 1):
+        if not isinstance(q, dict):
+            continue
+        header = q.get("header") or f"Question {idx}"
+        question = q.get("question") or ""
+        lines.append(f"{idx}. {header}")
+        if question:
+            lines.append(str(question))
+        options = q.get("options") if isinstance(q.get("options"), list) else []
+        if options:
+            lines.append("Options:")
+            for opt in options:
+                if isinstance(opt, dict):
+                    label = opt.get("label") or ""
+                    desc = opt.get("description") or ""
+                    suffix = f" - {desc}" if desc else ""
+                    lines.append(f"- {label}{suffix}")
+                else:
+                    lines.append(f"- {opt}")
+    return "\n".join(lines) if lines else "Question asked"
+
+
+def details_from_question_part(part_data: dict) -> dict:
+    state = part_data.get("state") if isinstance(part_data.get("state"), dict) else {}
+    input_data = state.get("input") if isinstance(state.get("input"), dict) else {}
+    questions = input_data.get("questions") if isinstance(input_data.get("questions"), list) else []
+    details = {
+        "questions": questions,
+        "tool": {
+            "messageID": part_data.get("messageID") or part_data.get("message_id"),
+            "callID": part_data.get("callID"),
+        },
+    }
+    details["message"] = get_question_message(details)
+    return details
+
+
+def active_opencode_questions() -> list[dict]:
+    """Return running OpenCode question tool parts from the real OpenCode DB."""
+    oc = open_opencode_db()
+    if not oc:
+        return []
+    try:
+        rows = oc.execute(
+            """
+            SELECT p.id AS part_id, p.message_id, p.session_id, p.time_created, p.time_updated,
+                   p.data, s.title, s.directory, s.time_updated AS session_updated
+            FROM part p
+            JOIN session s ON s.id = p.session_id
+            WHERE p.data LIKE '%question%'
+              AND (s.time_archived IS NULL OR s.time_archived = 0)
+            ORDER BY p.time_updated DESC
+            LIMIT 500
+            """
+        ).fetchall()
+    finally:
+        oc.close()
+
+    questions: list[dict] = []
+    for row in rows:
+        data = json_loads_maybe(row["data"])
+        if data.get("type") != "tool" or data.get("tool") != "question":
+            continue
+        state = data.get("state") if isinstance(data.get("state"), dict) else {}
+        if state.get("status") not in {"running", "pending"}:
+            continue
+        input_data = state.get("input") if isinstance(state.get("input"), dict) else {}
+        if not input_data.get("questions"):
+            # OpenCode briefly emits a pending empty shell before the question body arrives.
+            continue
+        details = details_from_question_part(data)
+        questions.append(
+            {
+                "session_id": row["session_id"],
+                "title": row["title"],
+                "directory": row["directory"],
+                "part_id": row["part_id"],
+                "message_id": row["message_id"],
+                "call_id": data.get("callID"),
+                "time_created": row["time_created"],
+                "time_updated": row["time_updated"],
+                "session_updated": row["session_updated"],
+                "details": details,
+            }
+        )
+    return questions
+
+
+def ensure_session_alias(conn: sqlite3.Connection, *, session_id: str, directory: str, title: str | None, status: str | None, last_activity_at: int | None, parent_id: str | None = None) -> int:
+    now = int(time.time() * 1000)
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO sessions
+        (session_id, short_id, directory, title, status, parent_id, is_child, deleted, last_activity_at, created_at, updated_at)
+        VALUES (?, (SELECT COALESCE(MAX(short_id), 0) + 1 FROM sessions), ?, ?, ?, ?, ?, 0, ?, ?, ?)
+        """,
+        (session_id, directory or "", title, status or "unknown", parent_id, 1 if parent_id else 0, last_activity_at or now, now, now),
+    )
+    conn.execute(
+        """
+        UPDATE sessions
+        SET directory = COALESCE(NULLIF(?, ''), directory), title = COALESCE(?, title),
+            status = COALESCE(?, status), parent_id = COALESCE(?, parent_id),
+            is_child = ?, deleted = 0, last_activity_at = COALESCE(?, last_activity_at), updated_at = ?
+        WHERE session_id = ?
+        """,
+        (directory or "", title, status, parent_id, 1 if parent_id else 0, last_activity_at, now, session_id),
+    )
+    row = conn.execute("SELECT short_id FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+    return int(row["short_id"])
+
+
+def ensure_question_correlation(conn: sqlite3.Connection, question: dict) -> sqlite3.Row | None:
+    """Refresh or create relay token for a live OpenCode question.
+
+    If OpenCode's event-created correlation exists, keep its token/request_id and
+    extend expiry. If no request_id exists, create a visible token anyway, but it
+    cannot be answered until a request_id-bearing event correlation appears.
+    """
+    now = int(time.time() * 1000)
+    expires = now + QUESTION_CORRELATION_TTL_SECONDS * 1000
+    session_id = question["session_id"]
+    call_id = question.get("call_id")
+    details = question.get("details") or {}
+    details_json = json.dumps(details)
+
+    candidates = conn.execute(
+        """
+        SELECT * FROM correlations
+        WHERE opencode_session_id = ? AND event_type IN ('question.asked', 'question.v2.asked')
+        ORDER BY created_at DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    chosen = None
+    for row in candidates:
+        row_details = json_loads_maybe(row["details"])
+        row_call = ((row_details.get("tool") or {}).get("callID") if isinstance(row_details.get("tool"), dict) else None)
+        if call_id and row_call == call_id:
+            chosen = row
+            break
+    if not chosen and candidates:
+        # Prefer the newest request-id-bearing correlation for the session.
+        chosen = next((r for r in candidates if r["request_id"]), candidates[0])
+
+    if chosen:
+        conn.execute(
+            "UPDATE correlations SET details = COALESCE(?, details), expires_at = ? WHERE token = ?",
+            (details_json, expires, chosen["token"]),
+        )
+        conn.commit()
+        return conn.execute("SELECT * FROM correlations WHERE token = ?", (chosen["token"],)).fetchone()
+
+    token_seed = question.get("part_id") or session_id
+    token = "q_" + re.sub(r"[^A-Za-z0-9]", "", token_seed)[-10:]
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO correlations
+        (token, opencode_session_id, directory, event_type, request_id, details, created_at, expires_at)
+        VALUES (?, ?, ?, 'question.asked', NULL, ?, ?, ?)
+        """,
+        (token, session_id, question.get("directory") or "", details_json, now, expires),
+    )
+    conn.commit()
+    return conn.execute("SELECT * FROM correlations WHERE token = ?", (token,)).fetchone()
+
+
+def sync_active_questions(conn: sqlite3.Connection) -> list[dict]:
+    questions = active_opencode_questions()
+    synced: list[dict] = []
+    for q in questions:
+        short_id = ensure_session_alias(
+            conn,
+            session_id=q["session_id"],
+            directory=q.get("directory") or "",
+            title=q.get("title"),
+            status="question",
+            last_activity_at=q.get("time_updated") or q.get("session_updated"),
+        )
+        corr = ensure_question_correlation(conn, q)
+        q["short_id"] = short_id
+        q["token"] = corr["token"] if corr else None
+        q["request_id"] = corr["request_id"] if corr else None
+        synced.append(q)
+    return synced
+
+
+def recent_opencode_sessions(limit: int = 50) -> list[dict]:
+    oc = open_opencode_db()
+    if not oc:
+        return []
+    try:
+        rows = oc.execute(
+            """
+            SELECT id, parent_id, title, directory, time_created, time_updated, time_archived,
+                   agent, model, cost, tokens_input, tokens_output
+            FROM session
+            WHERE (time_archived IS NULL OR time_archived = 0)
+            ORDER BY time_updated DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        oc.close()
+    return [dict(r) for r in rows]
+
+
+def sync_recent_sessions(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
+    questions_by_session = {q["session_id"]: q for q in sync_active_questions(conn)}
+    synced: list[dict] = []
+    for row in recent_opencode_sessions(limit):
+        if row.get("parent_id"):
+            continue
+        status = "question" if row["id"] in questions_by_session else "unknown"
+        relay = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (row["id"],)).fetchone()
+        if status == "unknown" and relay and relay["status"]:
+            status = relay["status"]
+        short_id = ensure_session_alias(
+            conn,
+            session_id=row["id"],
+            directory=row.get("directory") or "",
+            title=row.get("title"),
+            status=status,
+            last_activity_at=row.get("time_updated"),
+            parent_id=row.get("parent_id"),
+        )
+        row["short_id"] = short_id
+        row["status"] = status
+        synced.append(row)
+    conn.commit()
+    return synced
+
+
+def resolve_session_by_short_id(conn: sqlite3.Connection, short_id: int) -> sqlite3.Row | None:
+    sync_recent_sessions(conn, 100)
+    return conn.execute(
+        "SELECT * FROM sessions WHERE short_id = ? AND deleted = 0",
+        (short_id,),
+    ).fetchone()
+
+
+def latest_assistant_text_from_opencode(session_id: str) -> str | None:
+    oc = open_opencode_db()
+    if not oc:
+        return None
+    try:
+        rows = oc.execute(
+            """
+            SELECT p.data
+            FROM part p
+            JOIN message m ON m.id = p.message_id AND m.session_id = p.session_id
+            WHERE p.session_id = ?
+            ORDER BY p.time_created DESC
+            LIMIT 200
+            """,
+            (session_id,),
+        ).fetchall()
+    finally:
+        oc.close()
+    chunks: list[str] = []
+    for row in rows:
+        data = json_loads_maybe(row["data"])
+        if data.get("type") == "text" and data.get("text"):
+            chunks.append(str(data["text"]))
+            if len("\n".join(chunks)) > 4000:
+                break
+    return "\n\n".join(reversed(chunks)) if chunks else None
+
+
+def active_questions_for_session(conn: sqlite3.Connection, session_id: str) -> list[dict]:
+    return [q for q in sync_active_questions(conn) if q.get("session_id") == session_id]
 
 
 def parse_new_command_args(argv: list[str]) -> tuple[dict, str | None]:
@@ -361,16 +665,28 @@ def ensure_tables(conn: sqlite3.Connection) -> None:
 
 
 def cmd_pending(conn: sqlite3.Connection) -> int:
-    """List pending correlations (sessions waiting for input)."""
+    """List pending sessions/questions waiting for input.
+
+    OpenCode DB is the source of truth for active questions; relay DB is used
+    for tokens and command state.
+    """
+    active_questions = sync_active_questions(conn)
+    active_question_tokens = {str(q.get("token")) for q in active_questions if q.get("token")}
     now = int(time.time() * 1000)
+    params: list[object] = [now]
+    active_clause = ""
+    if active_question_tokens:
+        placeholders = ",".join("?" for _ in active_question_tokens)
+        active_clause = f" OR token IN ({placeholders})"
+        params.extend(sorted(active_question_tokens))
     rows = conn.execute(
-        """
+        f"""
         SELECT token, opencode_session_id, directory, event_type, request_id, details, created_at
         FROM correlations
-        WHERE expires_at > ?
+        WHERE expires_at > ?{active_clause}
         ORDER BY created_at DESC
         """,
-        (now,),
+        params,
     ).fetchall()
 
     if not rows:
@@ -411,66 +727,51 @@ def cmd_pending(conn: sqlite3.Connection) -> int:
 
 
 def cmd_oc_questions(conn: sqlite3.Connection) -> int:
-    """Show active question prompts from OpenCode."""
-    now = int(time.time() * 1000)
-    rows = conn.execute(
-        """
-        SELECT token, opencode_session_id, directory, event_type, request_id, details, created_at
-        FROM correlations
-        WHERE expires_at > ? AND event_type IN ('question.asked', 'question.v2.asked')
-        ORDER BY created_at DESC
-        """,
-        (now,),
-    ).fetchall()
+    """Show active question prompts from OpenCode DB, the source of truth."""
+    visible = sync_active_questions(conn)
 
-    visible = []
-    for r in rows:
-        existing = conn.execute(
-            "SELECT 1 FROM commands WHERE token = ? AND target_kind = 'correlation' AND status = 'pending'",
-            (r["token"],),
-        ).fetchone()
-        if existing:
-            continue
-        details = None
-        if r["details"]:
-            try:
-                details = json.loads(r["details"])
-            except Exception:
-                details = {"message": r["details"]}
-        visible.append((r, details))
+    # Hide questions that already have an unprocessed answer command queued.
+    filtered = []
+    for q in visible:
+        token = q.get("token")
+        if token:
+            existing = conn.execute(
+                "SELECT 1 FROM commands WHERE token = ? AND target_kind = 'correlation' AND status = 'pending'",
+                (token,),
+            ).fetchone()
+            if existing:
+                continue
+        filtered.append(q)
 
-    if not visible:
+    if not filtered:
         print("📭 No active OpenCode questions.")
         return 0
 
     print(format_separator())
-    print(f"❓ OpenCode questions ({len(visible)})")
+    print(f"❓ OpenCode questions ({len(filtered)})")
     print(format_separator())
-    for r, details in visible:
-        print(f"Token: {r['token']}")
-        print(f"Session: {r['opencode_session_id']}")
-        print(f"Dir: {Path(r['directory']).name if r['directory'] else 'unknown'}")
-        print(f"Age: {format_relative_age(r['created_at'])}")
-        message = details.get("message") if isinstance(details, dict) else None
+    for q in filtered:
+        token = q.get("token") or "(no token)"
+        print(f"Token: {token}")
+        print(f"Session: #{q.get('short_id')}  {q.get('session_id')}")
+        print(f"Title: {q.get('title') or 'untitled'}")
+        print(f"Dir: {Path(q.get('directory') or '').name if q.get('directory') else 'unknown'}")
+        print(f"Age: {format_relative_age(q.get('time_created'))}")
+        if not q.get("request_id"):
+            print("⚠️ Answer token has no request_id yet; visibility works, answer may need the live plugin event token.")
+        message = get_question_message(q.get("details") or {})
         if message:
             print()
             print(message)
         print()
-        print(f"Reply: /oc answer {r['token']} <answer>")
+        print(f"Reply: /oc answer {token} <answer>")
         print(format_separator())
     return 0
 
 
 def cmd_oc_list(conn: sqlite3.Connection) -> int:
-    """List active opencode sessions by short ID."""
-    rows = conn.execute(
-        """
-        SELECT short_id, title, status, directory, last_activity_at
-        FROM sessions
-        WHERE deleted = 0 AND is_child = 0
-        ORDER BY last_activity_at DESC
-        """
-    ).fetchall()
+    """List active opencode sessions by short ID, sourced from OpenCode DB."""
+    rows = sync_recent_sessions(conn, 50)
 
     as_json = "--json" in sys.argv
 
@@ -478,14 +779,15 @@ def cmd_oc_list(conn: sqlite3.Connection) -> int:
         sessions = [
             {
                 "short_id": r["short_id"],
+                "session_id": r["id"],
                 "title": r["title"],
                 "status": r["status"],
                 "directory": r["directory"],
-                "last_activity_at": r["last_activity_at"],
+                "last_activity_at": r["time_updated"],
             }
             for r in rows
         ]
-        print(json.dumps({"sessions": sessions}, indent=2))
+        print(json.dumps({"sessions": sessions, "source": "opencode.db"}, indent=2))
         return 0
 
     if not rows:
@@ -494,6 +796,7 @@ def cmd_oc_list(conn: sqlite3.Connection) -> int:
 
     print(format_separator())
     print(f"📋 OpenCode sessions ({len(rows)})")
+    print("Source: opencode.db")
     print(format_separator())
     for r in rows:
         title = r["title"] or "untitled"
@@ -501,48 +804,55 @@ def cmd_oc_list(conn: sqlite3.Connection) -> int:
         print(f"#{r['short_id']}  {format_status_badge(r['status'])}")
         print(f"Title: {title}")
         print(f"Dir: {directory_name}")
-        print(f"Last active: {format_relative_age(r['last_activity_at'])}")
+        print(f"Last active: {format_relative_age(r['time_updated'])}")
         print(format_separator())
     return 0
 
 
 def cmd_oc_show(conn: sqlite3.Connection, session_id: str) -> int:
-    """Show the latest assistant message for a session."""
+    """Show the latest assistant text and any active question from OpenCode DB."""
     try:
         short_id = int(session_id)
     except ValueError:
         print(json.dumps({"error": f"invalid session id '{session_id}'", "ok": False}))
         return 1
 
-    row = conn.execute(
-        """
-        SELECT title, status, last_assistant_text, session_id
-        FROM sessions
-        WHERE short_id = ? AND deleted = 0
-        """,
-        (short_id,),
-    ).fetchone()
-
+    row = resolve_session_by_short_id(conn, short_id)
     if not row:
         print(json.dumps({"error": f"No session #{short_id} found.", "ok": False}))
         return 1
 
     title = row["title"] or "untitled"
-    text = row["last_assistant_text"]
-    if not text:
-        print(f"Session #{short_id} ({title}) has no assistant message yet.")
-        return 0
+    text = latest_assistant_text_from_opencode(row["session_id"])
+    questions = active_questions_for_session(conn, row["session_id"])
 
     print(format_separator())
     print(f"🤖 OpenCode session #{short_id}")
     print(f"Title: {title}")
     print(f"Status: {row['status'] or 'unknown'}")
     print(f"Session ID: {row['session_id']}")
+    print("Source: opencode.db")
     print(format_separator())
-    print()
-    print(text)
-    print()
-    print(format_separator())
+
+    if questions:
+        print()
+        print(f"❓ Active question(s): {len(questions)}")
+        for q in questions:
+            token = q.get("token") or "(no token)"
+            print(f"Token: {token}")
+            print(get_question_message(q.get("details") or {}))
+            print(f"Reply: /oc answer {token} <answer>")
+            if not q.get("request_id"):
+                print("⚠️ This token has no request_id; answering may not work until the live event token is captured.")
+            print(format_separator())
+
+    if text:
+        print()
+        print(text)
+        print()
+        print(format_separator())
+    elif not questions:
+        print(f"Session #{short_id} ({title}) has no assistant text yet.")
     return 0
 
 
@@ -770,15 +1080,30 @@ def create_command(
     """Write a command to the commands table."""
     now = int(time.time() * 1000)
 
-    # Verify the correlation exists and is not expired.
+    # Refresh OpenCode DB-backed active questions before resolving tokens.
+    sync_active_questions(conn)
+
+    # Verify the correlation exists. Questions are allowed past their old TTL if
+    # OpenCode DB still shows a live question and sync_active_questions refreshed it.
     corr = conn.execute(
-        "SELECT * FROM correlations WHERE token = ? AND expires_at > ?",
+        "SELECT * FROM correlations WHERE token = ? AND (expires_at > ? OR event_type IN ('question.asked', 'question.v2.asked'))",
         (token, now),
     ).fetchone()
     if not corr:
         print(
             json.dumps(
                 {"error": f"no active correlation for token '{token}'", "ok": False}
+            )
+        )
+        return 1
+
+    if action == "answer" and corr["event_type"] in {"question.asked", "question.v2.asked"} and not corr["request_id"]:
+        print(
+            json.dumps(
+                {
+                    "error": f"question token '{token}' is visible from OpenCode DB but has no request_id, so it cannot be answered via pluginClient.question.reply yet",
+                    "ok": False,
+                }
             )
         )
         return 1
@@ -811,6 +1136,7 @@ def create_command(
     valid_actions = {
         "permission.asked": {"approve", "reject"},
         "question.asked": {"answer"},
+        "question.v2.asked": {"answer"},
         "session.idle": {"continue"},
     }
     allowed = valid_actions.get(event_type, set())

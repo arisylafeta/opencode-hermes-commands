@@ -113,7 +113,7 @@ opencode-hermes-commands/
 
 ### Shared SQLite database
 
-`state.db` is the single source of truth for session metadata and queued commands. Both the bridge (Python) and the OpenCode plugin (Bun/JavaScript) read and write to it using WAL mode with a 3-second busy timeout.
+`state.db` is the relay/control-plane database, not the source of truth for OpenCode session state. It stores stable short IDs, notification/answer correlation tokens, and queued commands. OpenCode's own database (`~/.local/share/opencode/opencode.db`) is the source of truth for sessions, messages, and active question tool parts. Commands such as `/oc questions`, `/oc list`, and `/oc show` read OpenCode DB directly and use `state.db` only to attach tokens/queue replies.
 
 ## Configuration
 
