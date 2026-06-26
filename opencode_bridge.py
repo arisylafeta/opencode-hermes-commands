@@ -107,7 +107,9 @@ def format_oc_help() -> str:
             "🤖 OpenCode controls",
             format_separator(),
             "📂 Sessions",
-            "• /oc list",
+            "• /oc list               (live/blocking only)",
+            "• /oc list --all         (recent history)",
+            "• /oc ps                 (actual RAM-using processes)",
             "• /oc show <id>",
             "• /oc reply <id> <message>",
             "• /oc kill <id> [id...]",
@@ -149,6 +151,54 @@ def format_relative_age(timestamp_ms: int | None) -> str:
         return f"{hours}h {minutes % 60}m ago"
     days = hours // 24
     return f"{days}d {hours % 24}h ago"
+
+
+def live_opencode_processes() -> list[dict]:
+    """Return live OpenCode parent processes and child language servers.
+
+    This is intentionally OS/process based, not OpenCode DB based. DB sessions are
+    resumable history; processes are what consume RAM now.
+    """
+    processes: list[dict] = []
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            cmdline = (entry / "cmdline").read_bytes().replace(b"\x00", b" ").decode(errors="replace").strip()
+            if not cmdline:
+                continue
+            if "opencode" not in cmdline:
+                continue
+            # Exclude this bridge/grep shell if its command text mentions opencode.
+            comm = (entry / "comm").read_text(errors="replace").strip()
+            if comm not in {"opencode", "node"} and "opencode run" not in cmdline:
+                continue
+            stat = (entry / "stat").read_text().split()
+            ppid = int(stat[3])
+            rss_mb = int(stat[23]) * os.sysconf("SC_PAGE_SIZE") // 1024 // 1024
+            cwd = os.readlink(entry / "cwd")
+            session_match = re.search(r"--session\s+(ses_[A-Za-z0-9]+)", cmdline)
+            processes.append(
+                {
+                    "pid": pid,
+                    "ppid": ppid,
+                    "comm": comm,
+                    "rss_mb": rss_mb,
+                    "cwd": cwd,
+                    "cmd": compact_whitespace(cmdline),
+                    "session_id": session_match.group(1) if session_match else None,
+                    "is_parent": comm == "opencode",
+                }
+            )
+        except Exception:
+            continue
+    return sorted(processes, key=lambda p: (not p["is_parent"], -int(p["rss_mb"])))
+
+
+def live_opencode_session_ids() -> set[str]:
+    return {str(p["session_id"]) for p in live_opencode_processes() if p.get("session_id")}
 
 
 def format_status_badge(status: str | None) -> str:
@@ -836,10 +886,18 @@ def cmd_oc_questions(conn: sqlite3.Connection) -> int:
 
 
 def cmd_oc_list(conn: sqlite3.Connection) -> int:
-    """List active opencode sessions by short ID, sourced from OpenCode DB."""
-    rows = sync_recent_sessions(conn, 50)
+    """List OpenCode sessions.
 
+    Default is live/question sessions only, so the command does not imply every
+    historical DB session is an active process. Use --all for recent resumable
+    history.
+    """
     as_json = "--json" in sys.argv
+    show_all = "--all" in sys.argv or "--history" in sys.argv
+    rows = sync_recent_sessions(conn, 50)
+    live_session_ids = live_opencode_session_ids()
+    if not show_all:
+        rows = [r for r in rows if r["status"] in {"question", "busy"} or r["id"] in live_session_ids]
 
     if as_json:
         sessions = [
@@ -850,28 +908,54 @@ def cmd_oc_list(conn: sqlite3.Connection) -> int:
                 "status": r["status"],
                 "directory": r["directory"],
                 "last_activity_at": r["time_updated"],
+                "live_process": r["id"] in live_session_ids,
             }
             for r in rows
         ]
-        print(json.dumps({"sessions": sessions, "source": "opencode.db"}, indent=2))
+        print(json.dumps({"sessions": sessions, "source": "opencode.db", "mode": "all" if show_all else "live"}, indent=2))
         return 0
 
     if not rows:
-        print("📭 No active OpenCode sessions.")
+        print("📭 No live/blocking OpenCode sessions. Use /oc list --all for recent resumable history.")
         return 0
 
     print(format_separator())
     print(f"📋 OpenCode sessions ({len(rows)})")
-    print("Source: opencode.db")
+    print("Mode: recent history" if show_all else "Mode: live/blocking only")
+    print("Source: opencode.db + /proc")
     print(format_separator())
     for r in rows:
         title = r["title"] or "untitled"
         directory_name = Path(r["directory"]).name if r["directory"] else "unknown"
-        print(f"#{r['short_id']}  {format_status_badge(r['status'])}")
+        live = " live" if r["id"] in live_session_ids else " history"
+        print(f"#{r['short_id']}  {format_status_badge(r['status'])}  {live}")
         print(f"Title: {title}")
         print(f"Dir: {directory_name}")
         print(f"Last active: {format_relative_age(r['time_updated'])}")
         print(format_separator())
+    return 0
+
+
+def cmd_oc_ps() -> int:
+    """Show actual live OpenCode OS processes consuming memory."""
+    processes = live_opencode_processes()
+    parents = [p for p in processes if p["is_parent"]]
+    children = [p for p in processes if not p["is_parent"]]
+    if not processes:
+        print("📭 No live OpenCode processes.")
+        return 0
+    total_mb = sum(int(p["rss_mb"]) for p in processes)
+    print(format_separator())
+    print(f"🧠 Live OpenCode processes: {len(parents)} parent, {len(children)} child, ~{total_mb} MB RSS")
+    print(format_separator())
+    for p in parents:
+        session = f" session={p['session_id']}" if p.get("session_id") else " session=unknown"
+        print(f"PID {p['pid']}  {p['rss_mb']} MB  cwd={Path(p['cwd']).name}{session}")
+        print(p["cmd"][:220])
+        print(format_separator())
+    if children:
+        child_mb = sum(int(p["rss_mb"]) for p in children)
+        print(f"Child language servers: {len(children)}, ~{child_mb} MB RSS")
     return 0
 
 
@@ -1462,6 +1546,9 @@ def main() -> int:
 
             if subcommand == "list":
                 return cmd_oc_list(conn)
+
+            elif subcommand in {"ps", "processes"}:
+                return cmd_oc_ps()
 
             elif subcommand in {"questions", "pending"}:
                 return cmd_oc_questions(conn)
