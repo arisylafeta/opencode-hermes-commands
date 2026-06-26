@@ -105,7 +105,6 @@ def format_oc_help() -> str:
             "• /oc list",
             "• /oc show <id>",
             "• /oc reply <id> <message>",
-            "• /oc <id> <message>",
             "• /oc kill <id> [id...]",
             "• /oc status <id>",
             "",
@@ -113,7 +112,6 @@ def format_oc_help() -> str:
             "• /oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>",
             "",
             "💬 Examples",
-            "• /oc 21 continue from the last failing test",
             "• /oc reply 21 keep going, focus on the auth bug",
             "• /oc kill 21 24 28",
             "• /oc new --preset cheap-flex audit this repo for dead code",
@@ -1000,17 +998,8 @@ def main() -> int:
                 return cmd_oc_new(conn, sys.argv[3:])
 
             else:
-                # Treat as: /oc <id> <prompt>
-                try:
-                    session_id = int(subcommand)
-                except ValueError:
-                    print(json.dumps({"error": f"unknown /oc subcommand '{subcommand}'\n\n{format_oc_help()}", "ok": False}))
-                    return 1
-                if len(sys.argv) < 4:
-                    print(json.dumps({"error": f"usage: /oc {session_id} <prompt>", "ok": False}))
-                    return 1
-                message = " ".join(sys.argv[3:])
-                return cmd_oc_prompt(conn, str(session_id), message)
+                print(json.dumps({"error": f"unknown /oc subcommand '{subcommand}'\n\n{format_oc_help()}", "ok": False}))
+                return 1
 
         elif action == "pending":
             return cmd_pending(conn)

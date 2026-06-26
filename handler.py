@@ -49,7 +49,6 @@ def handle_oc(raw_args: str) -> str | None:
             "/oc list\n"
             "/oc show <id>\n"
             "/oc reply <id> <message>\n"
-            "/oc <id> <message>\n"
             "/oc kill <id> [id...]\n"
             "/oc status <id>\n"
             "/oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>"
