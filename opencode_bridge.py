@@ -155,6 +155,8 @@ def format_status_badge(status: str | None) -> str:
     value = (status or "unknown").lower()
     if value == "busy":
         return "🟡 busy"
+    if value == "question":
+        return "❓ question"
     if value == "idle":
         return "🟢 idle"
     return f"⚪ {value}"
@@ -423,13 +425,63 @@ def recent_opencode_sessions(limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def infer_opencode_statuses(session_ids: list[str], question_session_ids: set[str]) -> dict[str, str]:
+    """Infer session status from OpenCode parts when relay status is absent.
+
+    OpenCode DB does not store a single status column. We infer the practical UI
+    status from active tool parts and final step-finish markers.
+    """
+    statuses: dict[str, str] = {}
+    oc = open_opencode_db()
+    if not oc:
+        return {sid: ("question" if sid in question_session_ids else "unknown") for sid in session_ids}
+    try:
+        for sid in session_ids:
+            if sid in question_session_ids:
+                statuses[sid] = "question"
+                continue
+            rows = oc.execute(
+                """
+                SELECT data
+                FROM part
+                WHERE session_id = ?
+                ORDER BY time_updated DESC
+                LIMIT 50
+                """,
+                (sid,),
+            ).fetchall()
+            status = "idle"
+            for row in rows:
+                data = json_loads_maybe(row["data"])
+                typ = data.get("type")
+                if typ == "tool":
+                    raw_state = data.get("state")
+                    state = raw_state if isinstance(raw_state, dict) else {}
+                    tool_status = state.get("status")
+                    tool = data.get("tool")
+                    if tool == "question" and tool_status in {"running", "pending"}:
+                        status = "question"
+                        break
+                    if tool_status in {"running", "pending"}:
+                        status = "busy"
+                        break
+                if typ == "step-finish":
+                    status = "idle"
+                    break
+            statuses[sid] = status
+    finally:
+        oc.close()
+    return statuses
+
+
 def sync_recent_sessions(conn: sqlite3.Connection, limit: int = 50) -> list[dict]:
     questions_by_session = {q["session_id"]: q for q in sync_active_questions(conn)}
+    rows = recent_opencode_sessions(limit)
+    root_rows = [row for row in rows if not row.get("parent_id")]
+    inferred_status = infer_opencode_statuses([row["id"] for row in root_rows], set(questions_by_session))
     synced: list[dict] = []
-    for row in recent_opencode_sessions(limit):
-        if row.get("parent_id"):
-            continue
-        status = "question" if row["id"] in questions_by_session else "unknown"
+    for row in root_rows:
+        status = inferred_status.get(row["id"], "unknown")
         relay = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (row["id"],)).fetchone()
         if status == "unknown" and relay and relay["status"]:
             status = relay["status"]
