@@ -706,6 +706,22 @@ function getNestedStringProp(props, objectKey, key) {
 function getStatusType(props) {
   return getStringProp(props, "type") ?? getNestedStringProp(props, "status", "type");
 }
+function baseEventType(type) {
+  if (typeof type !== "string") return "";
+  return type.replace(/\.\d+$/, "");
+}
+function eventProperties(event) {
+  if (event?.properties && typeof event.properties === "object") return event.properties;
+  const data = event?.data;
+  if (data && typeof data === "object") return data;
+  if (typeof data === "string") {
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === "object") return parsed;
+    } catch {}
+  }
+  return {};
+}
 
 function formatQuestionDetails(props) {
   const questions = Array.isArray(props?.questions) ? props.questions : [];
@@ -735,7 +751,7 @@ function formatQuestionDetails(props) {
 }
 
 function questionDetailsFromEvent(event) {
-  const props = event?.properties ?? {};
+  const props = eventProperties(event);
   return {
     message: formatQuestionDetails(props),
     questions: Array.isArray(props.questions) ? props.questions : [],
@@ -770,9 +786,10 @@ class SessionTracker {
   }
   trackEvent(event) {
     try {
-      const props = event.properties ?? {};
+      const props = eventProperties(event);
       const sessionId = getStringProp(props, "sessionID") ?? event.id;
-      switch (event.type) {
+      const eventType = baseEventType(event.type);
+      switch (eventType) {
         case "session.created":
         case "session.updated": {
           const state = this.ensureState(sessionId);
@@ -973,13 +990,13 @@ class SessionTracker {
     }
     return max;
   }
-  isQuiescent(sessionId, now, quiescenceMs) {
+  isQuiescent(sessionId, now, quiescenceMs, includeChildren = false) {
     const state = this.sessions.get(sessionId);
     if (!state)
       return false;
     if (state.deleted)
       return false;
-    if (state.isChild)
+    if (state.isChild && !includeChildren)
       return false;
     if (state.status !== "idle")
       return false;
@@ -996,12 +1013,13 @@ class SessionTracker {
   }
   shouldNotifyImmediate(event) {
     try {
-      if (event.type === "permission.asked")
+      const eventType = baseEventType(event.type);
+      if (eventType === "permission.asked")
         return true;
-      if (event.type === "question.asked" || event.type === "question.v2.asked")
+      if (eventType === "question.asked" || eventType === "question.v2.asked")
         return true;
-      if (event.type === "session.error") {
-        const error = event.properties?.error;
+      if (eventType === "session.error") {
+        const error = eventProperties(event).error;
         if (isBenignError(error))
           return false;
         return true;
@@ -1038,13 +1056,14 @@ class SessionTracker {
   }
   buildNotification(event) {
     try {
-      const props = event.properties ?? {};
+      const props = eventProperties(event);
       const sessionId = getStringProp(props, "sessionID") ?? event.id;
+      const eventType = baseEventType(event.type);
       const state = this.getState(sessionId);
       const baseTitle = state?.title ?? sessionId;
       const shortId = getDbShortId(sessionId);
       const title = shortId !== undefined ? `#${shortId} ${baseTitle}` : baseTitle;
-      switch (event.type) {
+      switch (eventType) {
         case "session.error": {
           const error = props.error;
           let message;
@@ -1107,10 +1126,10 @@ class SessionTracker {
       const title = shortId !== undefined ? `#${shortId} ${baseTitle}` : baseTitle;
       return {
         id: `${sessionId}-done-${Date.now()}`,
-        type: "done",
+        type: state.isChild ? "progress" : "done",
         sessionId,
         title,
-        message: "Session completed",
+        message: state.isChild ? "Subtask completed" : "Session completed",
         timestamp: Date.now()
       };
     } catch {
@@ -1146,6 +1165,10 @@ ${notification.message}${tokenLine}`;
       }
       case "done":
         return `\uD83D\uDFE2 opencode done
+*${title}*
+${notification.message}`;
+      case "progress":
+        return `\uD83D\uDFE2 opencode progress
 *${title}*
 ${notification.message}`;
       default:
@@ -1204,10 +1227,11 @@ class HermesRelayRuntime {
   }
   onEvent(event) {
     try {
-      const props = event.properties ?? {};
+      const props = eventProperties(event);
       const sessionId = typeof props.sessionID === "string" ? props.sessionID : event.id;
+      const eventType = baseEventType(event.type);
       const parentChain = [];
-      if (event.type === "session.deleted") {
+      if (eventType === "session.deleted") {
         let currentId = sessionId;
         while (currentId) {
           const state = this.sessionTracker.getState(currentId);
@@ -1220,7 +1244,7 @@ class HermesRelayRuntime {
       }
       this.sessionTracker.trackEvent(event);
       if (this.sessionTracker.shouldNotifyImmediate(event)) {
-        const immediateEventType = event.type;
+        const immediateEventType = eventType;
         if ((immediateEventType === "permission.asked" || immediateEventType === "question.asked" || immediateEventType === "question.v2.asked") && props.id) {
           const details = immediateEventType.startsWith("question") ? questionDetailsFromEvent(event) : undefined;
           createCorrelation(shortId(event.id), sessionId, pluginDirectory, immediateEventType, props.id, details);
@@ -1230,7 +1254,7 @@ class HermesRelayRuntime {
           this.scheduler.enqueue(notification);
         }
       }
-      switch (event.type) {
+      switch (eventType) {
         case "session.status": {
           const statusType = getStatusType(props);
           if (statusType === "busy") {
@@ -1260,7 +1284,7 @@ class HermesRelayRuntime {
         }
       }
       this.recomputeQuiescenceTimer(sessionId);
-      if (event.type === "session.deleted") {
+      if (eventType === "session.deleted") {
         for (const parentId of parentChain) {
           this.sessionTracker.resetDoneNotified(parentId);
           this.recomputeQuiescenceTimer(parentId);
@@ -1283,7 +1307,7 @@ class HermesRelayRuntime {
     try {
       this.quiescenceTimers.delete(sessionId);
       const now = Date.now();
-      if (this.sessionTracker.isQuiescent(sessionId, now, this.config.quiescenceMs)) {
+      if (this.sessionTracker.isQuiescent(sessionId, now, this.config.quiescenceMs, true)) {
         const notification = this.sessionTracker.buildDoneNotification(sessionId);
         if (notification) {
           this.scheduler.enqueue(notification);
@@ -1298,7 +1322,7 @@ class HermesRelayRuntime {
       const state = this.sessionTracker.getState(sessionId);
       if (!state)
         return;
-      if (state.isChild || state.deleted || state.status !== "idle")
+      if (state.deleted || state.status !== "idle")
         return;
       if (state.pendingPermission || state.pendingQuestion)
         return;
