@@ -77,6 +77,7 @@ Database: ~/.hermes/plugins/opencode-hermes-commands/state.db (shared with the p
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -110,6 +111,8 @@ def format_oc_help() -> str:
             "• /oc list               (live/blocking only)",
             "• /oc list --all         (recent history)",
             "• /oc ps                 (actual RAM-using processes)",
+            "• /oc reap [--keep N]    (kill orphan/old opencode processes)",
+            "• /oc kill-proc <pid>    (kill one process tree)",
             "• /oc show <id>",
             "• /oc reply <id> <message>",
             "• /oc kill <id> [id...]",
@@ -199,6 +202,52 @@ def live_opencode_processes() -> list[dict]:
 
 def live_opencode_session_ids() -> set[str]:
     return {str(p["session_id"]) for p in live_opencode_processes() if p.get("session_id")}
+
+
+def descendant_pids(root_pids: set[int]) -> set[int]:
+    children: dict[int, list[int]] = {}
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+            stat = (entry / "stat").read_text().split()
+            ppid = int(stat[3])
+            children.setdefault(ppid, []).append(pid)
+        except Exception:
+            continue
+    out: set[int] = set()
+    stack = list(root_pids)
+    while stack:
+        pid = stack.pop()
+        for child in children.get(pid, []):
+            if child not in out:
+                out.add(child)
+                stack.append(child)
+    return out
+
+
+def terminate_process_tree(root_pids: set[int]) -> dict:
+    targets = set(root_pids) | descendant_pids(root_pids)
+    if not targets:
+        return {"terminated": [], "remaining": []}
+    terminated: list[int] = []
+    for sig_name, sig in (("TERM", signal.SIGTERM), ("KILL", signal.SIGKILL)):
+        for pid in sorted(targets):
+            try:
+                os.kill(pid, sig)
+                if pid not in terminated:
+                    terminated.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        time.sleep(2 if sig_name == "TERM" else 1)
+        remaining = [pid for pid in sorted(targets) if Path(f"/proc/{pid}").exists()]
+        if not remaining:
+            return {"terminated": sorted(terminated), "remaining": []}
+    return {"terminated": sorted(terminated), "remaining": remaining}
 
 
 def format_status_badge(status: str | None) -> str:
@@ -959,6 +1008,87 @@ def cmd_oc_ps() -> int:
     return 0
 
 
+def parse_keep_arg(argv: list[str], default: int = 1) -> int:
+    if "--keep" not in argv:
+        return default
+    idx = argv.index("--keep")
+    try:
+        return max(0, int(argv[idx + 1]))
+    except Exception:
+        raise ValueError("usage: /oc reap [--keep N]")
+
+
+def cmd_oc_reap(argv: list[str]) -> int:
+    """Kill orphan/old OpenCode process trees.
+
+    By default this kills unmapped parent OpenCode processes and keeps mapped
+    session processes. With --keep N, it keeps the newest N parent processes and
+    kills the rest. This is intentionally OS-level cleanup, not session deletion.
+    """
+    as_json = "--json" in argv
+    dry_run = "--dry-run" in argv
+    keep = parse_keep_arg(argv, default=0)
+    parents = [p for p in live_opencode_processes() if p["is_parent"]]
+    # For reap without explicit --keep, kill all unmapped/orphan parents.
+    if "--keep" in argv:
+        newest_first = sorted(parents, key=lambda p: process_age_seconds(int(p["pid"])))
+        keep_pids = {int(p["pid"]) for p in newest_first[:keep]}
+        kill_parents = [p for p in parents if int(p["pid"]) not in keep_pids]
+    else:
+        # Kill parent processes that are not tied to a session id.
+        orphans = [p for p in parents if not p.get("session_id")]
+        kill_parents = orphans
+
+    root_pids = {int(p["pid"]) for p in kill_parents}
+    result = {"ok": True, "dry_run": dry_run, "keep": keep, "kill_parent_pids": sorted(root_pids)}
+    if not dry_run and root_pids:
+        result.update(terminate_process_tree(root_pids))
+    else:
+        result.update({"terminated": [], "remaining": []})
+
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return 0
+    if not root_pids:
+        print("✅ Nothing to reap. No matching old/orphan OpenCode parent processes.")
+        return 0
+    print(format_separator())
+    print(f"🧹 Reaped OpenCode processes ({'dry run' if dry_run else 'executed'})")
+    print(format_separator())
+    for p in kill_parents:
+        print(f"PID {p['pid']}  {p['rss_mb']} MB  cwd={Path(p['cwd']).name}  session={p.get('session_id') or 'unknown'}")
+    if result.get("remaining"):
+        print(f"⚠️ Remaining after kill: {result['remaining']}")
+    elif dry_run:
+        print("✅ Dry run only, no processes were killed")
+    else:
+        print("✅ Target process trees terminated")
+    return 0
+
+
+def process_age_seconds(pid: int) -> int:
+    try:
+        return int(subprocess.check_output(["ps", "-o", "etimes=", "-p", str(pid)], text=True).strip())
+    except Exception:
+        return 10**12
+
+
+def cmd_oc_kill_proc(argv: list[str]) -> int:
+    if not argv:
+        print(json.dumps({"ok": False, "error": "usage: /oc kill-proc <pid> [pid...]"}))
+        return 1
+    pids: set[int] = set()
+    for item in argv:
+        try:
+            pids.add(int(item))
+        except ValueError:
+            print(json.dumps({"ok": False, "error": f"invalid pid: {item}"}))
+            return 1
+    result = terminate_process_tree(pids)
+    print(json.dumps({"ok": not result.get("remaining"), "root_pids": sorted(pids), **result}, indent=2))
+    return 0 if not result.get("remaining") else 1
+
+
 def cmd_oc_show(conn: sqlite3.Connection, session_id: str) -> int:
     """Show the latest assistant text and any active question from OpenCode DB."""
     try:
@@ -1549,6 +1679,12 @@ def main() -> int:
 
             elif subcommand in {"ps", "processes"}:
                 return cmd_oc_ps()
+
+            elif subcommand == "reap":
+                return cmd_oc_reap(sys.argv[3:])
+
+            elif subcommand in {"kill-proc", "kill-pid"}:
+                return cmd_oc_kill_proc(sys.argv[3:])
 
             elif subcommand in {"questions", "pending"}:
                 return cmd_oc_questions(conn)
