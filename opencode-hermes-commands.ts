@@ -68,6 +68,13 @@ const DB_PATH =
   `${process.env.HOME ?? "/root"}/.hermes/plugins/opencode-hermes-commands/state.db`;
 const MAX_QUEUE = parseInt(process.env.HERMES_RELAY_MAX_QUEUE ?? "100", 10);
 const MAX_PER_HOUR = parseInt(process.env.HERMES_RELAY_MAX_PER_HOUR ?? "10", 10);
+const RELAY_PLATFORM = process.env.HERMES_RELAY_PLATFORM ?? "whatsapp";
+const TELEGRAM_BOT_TOKEN =
+  process.env.HERMES_TELEGRAM_BOT_TOKEN ??
+  process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID =
+  process.env.HERMES_TELEGRAM_CHAT_ID ??
+  process.env.TELEGRAM_HOME_CHANNEL;
 
 // Events that warrant an immediate phone notification.
 const PHONE_EVENTS = new Set<string>(["session.error"]);
@@ -802,7 +809,15 @@ function cleanupSentLog(): void {
   }
 }
 
-// ── WhatsApp delivery ───────────────────────────────────────────────────────
+// ── Message delivery (WhatsApp or Telegram) ─────────────────────────────────
+
+async function sendMessage(message: string): Promise<boolean> {
+  const platform = RELAY_PLATFORM.toLowerCase();
+  if (platform === "telegram") {
+    return sendTelegram(message);
+  }
+  return sendWhatsApp(message);
+}
 
 async function sendWhatsApp(message: string): Promise<boolean> {
   try {
@@ -826,6 +841,62 @@ async function sendWhatsApp(message: string): Promise<boolean> {
     }
   } catch (err) {
     log("error", `WhatsApp send failed: ${err}`);
+    return false;
+  }
+}
+
+async function sendTelegram(message: string): Promise<boolean> {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    log("error", "Telegram bot token or chat ID not configured");
+    return false;
+  }
+
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+
+  const sendWithMode = async (parseMode?: string): Promise<Response> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+    const body: Record<string, string> = {
+      chat_id: TELEGRAM_CHAT_ID,
+      text: message,
+    };
+    if (parseMode) {
+      body.parse_mode = parseMode;
+    }
+
+    try {
+      return await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  };
+
+  try {
+    let res = await sendWithMode("Markdown");
+    if (!res.ok && res.status === 400) {
+      let data: { description?: string } | undefined;
+      try {
+        data = await res.json();
+      } catch {
+        /* ignore */
+      }
+      if (data?.description?.toLowerCase().includes("markdown")) {
+        res = await sendWithMode();
+      }
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => String(res.status));
+      log("error", `Telegram API returned ${res.status}: ${text}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    log("error", `Telegram send failed: ${err}`);
     return false;
   }
 }
@@ -998,8 +1069,8 @@ Output: Wants to run git push to deploy. Needs approval.`;
       // Build the final WhatsApp message with header + summary + reply hint.
       const message = `${emoji} opencode ${label}\n*${titleLine}*\n${summary}\n${replyHint}`;
 
-      // Send the Hermes-generated summary to WhatsApp directly.
-      const sent = await sendWhatsApp(message);
+      // Send the Hermes-generated summary to the configured messaging platform.
+      const sent = await sendMessage(message);
       if (sent) {
         recordSend();
         log("debug", `Hermes summary sent to WhatsApp: ${message.slice(0, 80)}`);
@@ -1039,7 +1110,7 @@ async function drainOnce(): Promise<void> {
     return;
   }
 
-  const ok = await sendWhatsApp(row.message);
+  const ok = await sendMessage(row.message);
   if (ok) {
     recordSend();
     completeRow(row.id, row.event_id);

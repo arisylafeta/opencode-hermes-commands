@@ -1,4 +1,4 @@
-name: hermes-commands
+name: opencode-hermes-commands
 version: 0.1.0
 description: "OpenCode session slash commands for Hermes Agent. Provides /oc for listing, showing, and prompting opencode sessions from WhatsApp."
 hooks: []

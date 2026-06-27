@@ -536,8 +536,11 @@ function loadConfig() {
   return {
     enabled: parseBool(process.env.HERMES_RELAY_ENABLED, true),
     logLevel: parseString(process.env.HERMES_RELAY_LOG_LEVEL, "error"),
+    platform: parseString(process.env.HERMES_RELAY_PLATFORM, "whatsapp"),
     whatsappBridgeUrl: parseString(process.env.HERMES_WHATSAPP_BRIDGE_URL, "http://127.0.0.1:3000"),
     whatsappChatId: parseString(process.env.HERMES_WHATSAPP_CHAT_ID, process.env.WHATSAPP_HOME_CHANNEL ?? ""),
+    telegramBotToken: parseString(process.env.HERMES_TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_BOT_TOKEN),
+    telegramChatId: parseString(process.env.HERMES_TELEGRAM_CHAT_ID, process.env.TELEGRAM_HOME_CHANNEL),
     maxPerHour: parseIntDefault(process.env.HERMES_RELAY_MAX_PER_HOUR, 10),
     quiescenceMs: parseIntDefault(process.env.HERMES_RELAY_QUIESCENCE_MS, 300000),
     sendTimeoutMs: parseIntDefault(process.env.HERMES_RELAY_SEND_TIMEOUT_MS, 5000),
@@ -1139,7 +1142,7 @@ class SessionTracker {
 }
 
 // src/notifier.ts
-class WhatsAppNotifier {
+class Notifier {
   config;
   constructor(config) {
     this.config = config;
@@ -1176,7 +1179,7 @@ ${notification.message}`;
 ${notification.message}`;
     }
   }
-  async send(notification) {
+  async sendWhatsApp(notification) {
     if (!this.config.whatsappChatId) {
       return false;
     }
@@ -1202,6 +1205,61 @@ ${notification.message}`;
       clearTimeout(timeout);
     }
   }
+  async sendTelegram(notification) {
+    const botToken = this.config.telegramBotToken;
+    const chatId = this.config.telegramChatId;
+    if (!botToken || !chatId) {
+      return false;
+    }
+    const message = this.formatMessage(notification);
+    const baseUrl = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const sendWithMode = async (parseMode) => {
+      const body = { chat_id: chatId, text: message };
+      if (parseMode) {
+        body.parse_mode = parseMode;
+      }
+      const controller = new AbortController;
+      const timeout = setTimeout(() => controller.abort(), this.config.sendTimeoutMs);
+      try {
+        return await fetch(baseUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+    try {
+      let response = await sendWithMode("Markdown");
+      if (!response.ok && response.status === 400) {
+        let data;
+        try {
+          data = await response.json();
+        } catch {}
+        if (data?.description?.toLowerCase().includes("markdown")) {
+          response = await sendWithMode();
+        }
+      }
+      if (!response.ok) {
+        const text = await response.text().catch(() => String(response.status));
+        logPluginError("notifier.telegram", new Error(`Telegram API ${response.status}: ${text}`));
+        return false;
+      }
+      return true;
+    } catch (err) {
+      logPluginError("notifier.telegram", err);
+      return false;
+    }
+  }
+  async send(notification) {
+    const platform = (this.config.platform || "whatsapp").toLowerCase();
+    if (platform === "telegram") {
+      return this.sendTelegram(notification);
+    }
+    return this.sendWhatsApp(notification);
+  }
 }
 
 // src/runtime.ts
@@ -1214,7 +1272,7 @@ class HermesRelayRuntime {
   constructor(config) {
     this.config = config;
     this.sessionTracker = new SessionTracker;
-    this.notifier = new WhatsAppNotifier(config);
+    this.notifier = new Notifier(config);
     this.scheduler = new Scheduler(config, (n) => this.notifier.send(n));
   }
   start() {
