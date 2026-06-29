@@ -1,5 +1,7 @@
 # opencode-hermes-commands
 
+Canonical repo for the Hermes/OpenCode relay plugin. The live runtime still uses the same directory, and this repo is the source of truth.
+
 Control [OpenCode](https://opencode.ai) sessions from WhatsApp via the Hermes agent gateway.
 
 Send prompts, start new sessions, list active sessions, check status, and kill sessions, all from your phone.
@@ -15,6 +17,25 @@ WhatsApp message          Hermes gateway            OpenCode
 ```
 
 The Hermes gateway plugin registers the `/oc` slash command. When you send a message like `/oc reply 31 hello`, the handler shells out to `opencode_bridge.py`, which either queries the shared SQLite database (for listings/status) or launches `opencode run` directly (for new sessions and replies).
+
+## Deploy
+
+Use the bundled conservative deploy script to sync this repo into the live plugin path:
+
+```bash
+node scripts/deploy.mjs --dry-run
+node scripts/deploy.mjs
+```
+
+Safeguards:
+
+- dry-run support
+- required source file checks
+- never touches `state.db*`
+- prints SHA-256 checksums for copied files
+- verifies destination checksums after deploy
+- backs up overwritten files before replacement
+- uses atomic temp-file replacement
 
 ## Commands
 
@@ -70,7 +91,7 @@ ln -s /path/to/opencode-hermes-commands/opencode-hermes-commands.js \
       ~/.config/opencode/plugins/opencode-hermes-commands.js
 ```
 
-This plugin listens to OpenCode events and writes session metadata (short IDs, titles, status, last assistant text) to a shared SQLite database. It also polls for queued commands (used by `/oc kill` and permission replies).
+This plugin listens to OpenCode events and writes session metadata (short IDs, titles, status, last assistant text) to a shared SQLite database. It also polls for queued commands (used by `/oc kill` and permission replies). Child-session notifications stay suppressed, matching the current active fix in the runtime.
 
 ### 2. Install the Hermes gateway plugin
 

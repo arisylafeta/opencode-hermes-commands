@@ -1584,6 +1584,9 @@ export default {
 
           // session.error → direct WhatsApp (reliable fallback).
           if (event.type === "session.error") {
+            if (!shouldNotifySession(String(event.properties?.sessionID ?? ""))) {
+              return;
+            }
             if (isBenignSessionError(event.properties ?? {})) {
               return;
             }

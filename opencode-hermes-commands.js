@@ -1017,6 +1017,11 @@ class SessionTracker {
   shouldNotifyImmediate(event) {
     try {
       const eventType = baseEventType(event.type);
+      const props = eventProperties(event);
+      const sessionId = getStringProp(props, "sessionID") ?? event.id;
+      const state = this.getState(sessionId);
+      if (state?.isChild)
+        return false;
       if (eventType === "permission.asked")
         return true;
       if (eventType === "question.asked" || eventType === "question.v2.asked")
