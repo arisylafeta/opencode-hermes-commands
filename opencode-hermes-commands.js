@@ -1124,15 +1124,17 @@ class SessionTracker {
       const state = this.getState(sessionId);
       if (!state)
         return;
+      if (state.isChild)
+        return;
       const baseTitle = state.title ?? sessionId;
       const shortId = getDbShortId(sessionId);
       const title = shortId !== undefined ? `#${shortId} ${baseTitle}` : baseTitle;
       return {
         id: `${sessionId}-done-${Date.now()}`,
-        type: state.isChild ? "progress" : "done",
+        type: "done",
         sessionId,
         title,
-        message: state.isChild ? "Subtask completed" : "Session completed",
+        message: "Session completed",
         timestamp: Date.now()
       };
     } catch {
