@@ -1,6 +1,6 @@
 # opencode-hermes-commands
 
-Canonical repo for the Hermes/OpenCode relay plugin. The live runtime still uses the same directory, and this repo is the source of truth.
+Canonical repo for the Hermes/OpenCode relay plugin. The live runtime still uses the same directory, and this repo is the source of truth for both halves of the integration.
 
 Control [OpenCode](https://opencode.ai) sessions from WhatsApp via the Hermes agent gateway.
 
@@ -17,6 +17,13 @@ WhatsApp message          Hermes gateway            OpenCode
 ```
 
 The Hermes gateway plugin registers the `/oc` slash command. When you send a message like `/oc reply 31 hello`, the handler shells out to `opencode_bridge.py`, which either queries the shared SQLite database (for listings/status) or launches `opencode run` directly (for new sessions and replies).
+
+This is one package with two runtimes:
+
+- **OpenCode runtime:** `opencode-hermes-commands.js`, loaded by each OpenCode process from `~/.config/opencode/plugins/`, emits relay notifications and drains queued commands.
+- **Hermes gateway runtime:** `__init__.py` and `handler.py`, loaded by Hermes gateway, registers `/oc` and calls `opencode_bridge.py`.
+
+Those two runtimes cannot be the same OS process because OpenCode events only exist inside OpenCode and WhatsApp slash commands only exist inside Hermes gateway. They should still be installed, enabled, checked, and documented as one package.
 
 ## Deploy
 
@@ -37,6 +44,34 @@ Safeguards:
 - backs up overwritten files before replacement
 - uses atomic temp-file replacement
 
+## Install / health check
+
+Use the lifecycle script to make the package operational as one integration:
+
+```bash
+node scripts/install.mjs --dry-run
+node scripts/install.mjs
+```
+
+It ensures:
+
+- the OpenCode plugin symlink points to this repo's `opencode-hermes-commands.js`
+- `/usr/local/bin/opencode_bridge.py` points to this repo's bridge
+- the Hermes plugin is enabled with `hermes plugins enable opencode-hermes-commands`
+- `/oc health` is run at the end
+
+If the Hermes plugin was newly enabled, restart the gateway from outside the gateway process:
+
+```bash
+HERMES_HOME=/root/.hermes hermes gateway restart
+```
+
+Health can also be checked directly:
+
+```bash
+python3 opencode_bridge.py /oc health
+```
+
 ## Commands
 
 | Command | Description |
@@ -52,6 +87,7 @@ Safeguards:
 | `/oc new [options] <prompt>` | Start a new OpenCode session |
 | `/oc kill <id> [id...]` | Kill one or more sessions |
 | `/oc status <id>` | Check command status for a session |
+| `/oc health` | Check both runtimes, symlinks, Hermes enablement, DBs, and restart status |
 
 ### `/oc new` options
 
@@ -81,6 +117,8 @@ Safeguards:
 
 ## Setup
 
+Prefer `node scripts/install.mjs` for normal setup. Manual setup is below.
+
 ### 1. Install the OpenCode plugin
 
 The OpenCode plugin (`opencode-hermes-commands.js`) needs to be discoverable by OpenCode. Symlink it:
@@ -93,9 +131,15 @@ ln -s /path/to/opencode-hermes-commands/opencode-hermes-commands.js \
 
 This plugin listens to OpenCode events and writes session metadata (short IDs, titles, status, last assistant text) to a shared SQLite database. It also polls for queued commands (used by `/oc kill` and permission replies). Child-session notifications stay suppressed, matching the current active fix in the runtime.
 
-### 2. Install the Hermes gateway plugin
+### 2. Install and enable the Hermes gateway plugin
 
-The Hermes gateway plugin (`__init__.py`, `handler.py`, `plugin.yaml`) registers the `/oc` slash command. Place this repo (or a symlink) in your Hermes plugins directory.
+The Hermes gateway plugin (`__init__.py`, `handler.py`, `plugin.yaml`) registers the `/oc` slash command. Place this repo (or a symlink) in your Hermes plugins directory, then enable it:
+
+```bash
+HERMES_HOME=/root/.hermes hermes plugins enable opencode-hermes-commands
+```
+
+Restart Hermes gateway after enabling so the command registry is rebuilt.
 
 ### 3. Link the bridge script
 

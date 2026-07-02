@@ -117,6 +117,7 @@ def format_oc_help() -> str:
             "• /oc reply <id> <message>",
             "• /oc kill <id> [id...]",
             "• /oc status <id>",
+            "• /oc health             (plugin + relay health check)",
             "",
             "❓ Questions / approvals",
             "• /oc questions",
@@ -1624,6 +1625,133 @@ def cmd_status(conn: sqlite3.Connection, token: str, target_kind: str | None = N
     return 0
 
 
+
+def _read_text(path: Path, max_chars: int = 2000) -> str:
+    try:
+        return path.read_text(errors="replace")[:max_chars]
+    except Exception:
+        return ""
+
+
+def _proc_start_epoch(pid: int) -> float | None:
+    """Best-effort Linux process start time as epoch seconds."""
+    try:
+        ticks_per_second = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        stat_fields = Path(f"/proc/{pid}/stat").read_text().split()
+        start_ticks = int(stat_fields[21])
+        btime = None
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if btime is None:
+            return None
+        return btime + (start_ticks / ticks_per_second)
+    except Exception:
+        return None
+
+
+def _systemctl_user_show(property_name: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "hermes-gateway", f"--property={property_name}", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def _check_status(ok: bool, label: str, detail: str = "") -> tuple[bool, str]:
+    icon = "✅" if ok else "⚠️"
+    suffix = f" — {detail}" if detail else ""
+    return ok, f"{icon} {label}{suffix}"
+
+
+def cmd_oc_health(conn: sqlite3.Connection) -> int:
+    """Report health for the unified OpenCode/Hermes command package."""
+    plugin_dir = Path(__file__).resolve().parent
+    hermes_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    opencode_plugin_link = Path.home() / ".config" / "opencode" / "plugins" / "opencode-hermes-commands.js"
+    expected_js = plugin_dir / "opencode-hermes-commands.js"
+    bridge_link = Path("/usr/local/bin/opencode_bridge.py")
+    config_path = hermes_home / "config.yaml"
+    state_db_path = Path(DB_PATH)
+    opencode_db_path = Path(OPENCODE_DB_PATH)
+
+    checks: list[tuple[bool, str]] = []
+    checks.append(_check_status(plugin_dir.exists(), "Package directory", str(plugin_dir)))
+    checks.append(_check_status((plugin_dir / "plugin.yaml").exists(), "Hermes plugin metadata", "plugin.yaml"))
+    checks.append(_check_status((plugin_dir / "__init__.py").exists() and (plugin_dir / "handler.py").exists(), "Hermes /oc entrypoint", "__init__.py + handler.py"))
+    checks.append(_check_status(expected_js.exists(), "OpenCode relay runtime", expected_js.name))
+
+    if opencode_plugin_link.is_symlink():
+        resolved = opencode_plugin_link.resolve()
+        checks.append(_check_status(resolved == expected_js.resolve(), "OpenCode plugin symlink", f"{opencode_plugin_link} -> {resolved}"))
+    else:
+        checks.append(_check_status(False, "OpenCode plugin symlink", f"missing or not a symlink: {opencode_plugin_link}"))
+
+    if bridge_link.is_symlink() or bridge_link.exists():
+        try:
+            resolved_bridge = bridge_link.resolve()
+            checks.append(_check_status(resolved_bridge == (plugin_dir / "opencode_bridge.py").resolve(), "Bridge command link", f"{bridge_link} -> {resolved_bridge}"))
+        except Exception as exc:
+            checks.append(_check_status(False, "Bridge command link", str(exc)))
+    else:
+        checks.append(_check_status(False, "Bridge command link", f"missing: {bridge_link}"))
+
+    config_text = _read_text(config_path, max_chars=200000)
+    hermes_plugin_enabled = "opencode-hermes-commands" in config_text
+    checks.append(_check_status(hermes_plugin_enabled, "Hermes plugin enabled", str(config_path)))
+
+    gateway_active = _systemctl_user_show("ActiveState") == "active"
+    main_pid_raw = _systemctl_user_show("MainPID")
+    main_pid = int(main_pid_raw) if main_pid_raw and main_pid_raw.isdigit() else 0
+    restart_needed = False
+    if main_pid and config_path.exists():
+        started_at = _proc_start_epoch(main_pid)
+        if started_at and config_path.stat().st_mtime > started_at:
+            restart_needed = True
+    if gateway_active and restart_needed:
+        checks.append(_check_status(False, "Hermes gateway loaded plugin config", "restart required since config changed after gateway start"))
+    else:
+        detail = f"pid {main_pid}" if main_pid else "systemd user service"
+        checks.append(_check_status(gateway_active, "Hermes gateway running", detail))
+
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        checks.append(_check_status(state_db_path.exists(), "Relay/control DB readable", str(state_db_path)))
+    except Exception as exc:
+        checks.append(_check_status(False, "Relay/control DB readable", str(exc)))
+
+    checks.append(_check_status(opencode_db_path.exists(), "OpenCode source-of-truth DB", str(opencode_db_path)))
+    processes = live_opencode_processes()
+    parent_count = sum(1 for process in processes if process.get("is_parent"))
+    checks.append(_check_status(True, "Live OpenCode processes", f"{parent_count} parent(s), {len(processes)} total opencode-related process(es)"))
+
+    print("🩺 OpenCode Hermes command health")
+    print(format_separator())
+    print("One package, two runtimes:")
+    print("• OpenCode loads opencode-hermes-commands.js for relay events and command draining")
+    print("• Hermes gateway loads __init__.py/handler.py to register /oc")
+    print()
+    for _, line in checks:
+        print(line)
+    print(format_separator())
+    if restart_needed:
+        print("Next step: restart Hermes gateway from outside the gateway process:")
+        print("HERMES_HOME=/root/.hermes hermes gateway restart")
+    elif all(ok for ok, _ in checks):
+        print("✅ Unified package looks healthy.")
+    else:
+        print("⚠️ Fix the warnings above, then rerun /oc health.")
+    return 0 if all(ok for ok, _ in checks) and not restart_needed else 1
+
 def cmd_resolve(conn: sqlite3.Connection, token: str) -> int:
     """Show correlation details for a token."""
     row = conn.execute(
@@ -1673,6 +1801,9 @@ def main() -> int:
             if subcommand == "help":
                 print(format_oc_help())
                 return 0
+
+            if subcommand in {"health", "doctor"}:
+                return cmd_oc_health(conn)
 
             if subcommand == "list":
                 return cmd_oc_list(conn)

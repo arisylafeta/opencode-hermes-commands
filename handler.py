@@ -55,6 +55,7 @@ def handle_oc(raw_args: str) -> str | None:
             "/oc no <token> [reason]\n"
             "/oc kill <id> [id...]\n"
             "/oc status <id>\n"
+            "/oc health\n"
             "/oc new [--agent <name>] [--model <provider/model>] [--preset <name>] [--dir <path>] <prompt>"
         )
 
