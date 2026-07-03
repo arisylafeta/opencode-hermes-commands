@@ -610,30 +610,61 @@ def resolve_session_by_short_id(conn: sqlite3.Connection, short_id: int) -> sqli
 
 
 def latest_assistant_text_from_opencode(session_id: str) -> str | None:
+    """Return only the newest assistant text message for a session.
+
+    OpenCode stores every text part, including user prompts and older assistant
+    progress notes, in the shared `part` table. `/oc show` should display the
+    latest assistant response, not a reversed concatenation of the last N text
+    parts across the whole session.
+    """
     oc = open_opencode_db()
     if not oc:
         return None
     try:
-        rows = oc.execute(
+        messages = oc.execute(
             """
-            SELECT data
-            FROM part
+            SELECT id, data
+            FROM message
             WHERE session_id = ?
-            ORDER BY time_updated DESC
-            LIMIT 200
+            ORDER BY time_created DESC
+            LIMIT 100
             """,
             (session_id,),
         ).fetchall()
+
+        latest_text_rows: list[sqlite3.Row] | None = None
+        for message in messages:
+            message_data = json_loads_maybe(message["data"])
+            if message_data.get("role") != "assistant":
+                continue
+            rows = oc.execute(
+                """
+                SELECT data
+                FROM part
+                WHERE message_id = ?
+                ORDER BY time_created ASC
+                """,
+                (message["id"],),
+            ).fetchall()
+            if any(
+                json_loads_maybe(row["data"]).get("type") == "text"
+                and json_loads_maybe(row["data"]).get("text")
+                for row in rows
+            ):
+                latest_text_rows = rows
+                break
+
+        if not latest_text_rows:
+            return None
     finally:
         oc.close()
+
     chunks: list[str] = []
-    for row in rows:
+    for row in latest_text_rows:
         data = json_loads_maybe(row["data"])
         if data.get("type") == "text" and data.get("text"):
             chunks.append(str(data["text"]))
-            if len("\n".join(chunks)) > 4000:
-                break
-    return "\n\n".join(reversed(chunks)) if chunks else None
+    return "\n\n".join(chunks) if chunks else None
 
 
 def active_questions_for_session(conn: sqlite3.Connection, session_id: str) -> list[dict]:
