@@ -778,6 +778,7 @@ class SessionTracker {
         lastUserMessageAt: 0,
         lastAssistantMessageAt: 0,
         lastAssistantText: "",
+        activeToolParts: new Set,
         pendingPermission: false,
         pendingQuestion: false,
         deleted: false,
@@ -877,6 +878,19 @@ class SessionTracker {
             role = this.messageRoles.get(messageId);
           }
           const partType = getStringProp(props, "partType") ?? getStringProp(props, "type") ?? getNestedStringProp(props, "part", "type");
+          if (partType === "tool") {
+            const partId = getStringProp(props, "partID") ?? getStringProp(props, "id") ?? getNestedStringProp(props, "part", "id");
+            const partState = props.part && typeof props.part === "object" ? props.part.state : undefined;
+            const toolStatus = getNestedStringProp(props, "state", "status") ?? (partState && typeof partState === "object" ? getStringProp(partState, "status") : undefined) ?? getStringProp(props, "status");
+            if (partId) {
+              if (toolStatus === "running" || toolStatus === "pending" || toolStatus === "queued") {
+                state.activeToolParts.add(partId);
+              } else if (toolStatus === "completed" || toolStatus === "error" || toolStatus === "failed" || toolStatus === "cancelled") {
+                state.activeToolParts.delete(partId);
+              }
+            }
+            state.lastActivityAt = Date.now();
+          }
           if (role === "assistant" && partType === "text") {
             state.lastAssistantMessageAt = Date.now();
             state.lastActivityAt = Date.now();
@@ -967,6 +981,20 @@ class SessionTracker {
     }
     return false;
   }
+  hasActiveToolsInTree(sessionId) {
+    const state = this.sessions.get(sessionId);
+    if (!state)
+      return false;
+    if (state.activeToolParts && state.activeToolParts.size > 0)
+      return true;
+    for (const childId of state.children) {
+      const child = this.sessions.get(childId);
+      if (child && !child.deleted && this.hasActiveToolsInTree(childId)) {
+        return true;
+      }
+    }
+    return false;
+  }
   hasPendingInTree(sessionId) {
     const state = this.sessions.get(sessionId);
     if (!state)
@@ -1001,9 +1029,12 @@ class SessionTracker {
       return false;
     if (state.isChild && !includeChildren)
       return false;
-    if (state.status !== "idle")
+    const statusAllowsDone = state.status === "idle" || !!state.lastAssistantText;
+    if (!statusAllowsDone)
       return false;
     if (this.hasPendingInTree(sessionId))
+      return false;
+    if (this.hasActiveToolsInTree(sessionId))
       return false;
     if (this.hasActiveChildren(sessionId))
       return false;
@@ -1387,9 +1418,13 @@ class HermesRelayRuntime {
       const state = this.sessionTracker.getState(sessionId);
       if (!state)
         return;
-      if (state.deleted || state.status !== "idle")
+      if (state.deleted)
+        return;
+      if (state.status !== "idle" && !state.lastAssistantText)
         return;
       if (state.pendingPermission || state.pendingQuestion)
+        return;
+      if (this.sessionTracker.hasActiveToolsInTree(sessionId))
         return;
       if (this.sessionTracker.hasActiveChildren(sessionId))
         return;
