@@ -708,6 +708,29 @@ function getNestedStringProp(props, objectKey, key) {
 function getStatusType(props) {
   return getStringProp(props, "type") ?? getNestedStringProp(props, "status", "type");
 }
+function getMessageInfo(props) {
+  const info = props?.info;
+  if (info && typeof info === "object")
+    return info;
+  const message = props?.message;
+  if (message && typeof message === "object")
+    return message;
+  return {};
+}
+function getMessageRole(props) {
+  return getStringProp(props, "role") ?? getStringProp(getMessageInfo(props), "role");
+}
+function getMessageId(props) {
+  return getStringProp(props, "id") ?? getStringProp(getMessageInfo(props), "id") ?? getStringProp(props, "messageID");
+}
+function isUserSubmissionEvent(eventType, props, role) {
+  if (role === "user")
+    return true;
+  const command = getStringProp(props, "command");
+  if (eventType === "tui.command.execute" && command === "prompt.submit")
+    return true;
+  return eventType === "session.next.prompted" || eventType === "session.next.prompt.admitted" || eventType === "session.next.prompt.promoted";
+}
 function baseEventType(type) {
   if (typeof type !== "string") return "";
   return type.replace(/\.\d+$/, "");
@@ -777,6 +800,7 @@ class SessionTracker {
         lastUserMessageAt: 0,
         lastAssistantMessageAt: 0,
         lastAssistantText: "",
+        lastAssistantTextAt: 0,
         activeToolParts: new Set,
         pendingPermission: false,
         pendingQuestion: false,
@@ -814,12 +838,14 @@ class SessionTracker {
         case "session.status": {
           const state = this.ensureState(sessionId);
           const statusType = getStatusType(props);
+          const previousStatus = state.status;
           if (statusType === "busy" || statusType === "idle") {
             state.status = statusType;
           } else {
             state.status = "unknown";
           }
-          if (state.status === "busy") {
+          if (state.status === "busy" && previousStatus !== "busy") {
+            state.lastUserMessageAt = Date.now();
             state.doneNotifiedAt = 0;
           }
           state.lastActivityAt = Date.now();
@@ -852,8 +878,8 @@ class SessionTracker {
         }
         case "message.updated": {
           const state = this.ensureState(sessionId);
-          const role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
-          const messageId = getStringProp(props, "id") ?? getNestedStringProp(props, "info", "id");
+          const role = getMessageRole(props);
+          const messageId = getMessageId(props);
           if (messageId && role) {
             this.messageRoles.set(messageId, role);
             if (role === "assistant" && state.lastAssistantMessageId !== messageId) {
@@ -862,9 +888,10 @@ class SessionTracker {
               this.assistantMessageTexts.set(messageId, "");
             }
           }
-          if (role === "user") {
-            state.lastUserMessageAt = Date.now();
-            state.lastActivityAt = Date.now();
+          if (isUserSubmissionEvent(eventType, props, role)) {
+            const now = Date.now();
+            state.lastUserMessageAt = now;
+            state.lastActivityAt = now;
             state.doneNotifiedAt = 0;
           }
           break;
@@ -891,9 +918,10 @@ class SessionTracker {
             state.lastActivityAt = Date.now();
           }
           if (role === "assistant" && partType === "text") {
-            state.lastAssistantMessageAt = Date.now();
-            state.lastActivityAt = Date.now();
-            const text = getStringProp(props, "text") ?? getNestedStringProp(props, "part", "text");
+            const now = Date.now();
+            state.lastAssistantMessageAt = now;
+            state.lastActivityAt = now;
+            const text = getStringProp(props, "text") ?? getNestedStringProp(props, "part", "text") ?? getStringProp(props, "delta");
             if (text && messageId) {
               const previousText = this.assistantMessageTexts.get(messageId) ?? "";
               let nextText = text;
@@ -909,11 +937,32 @@ class SessionTracker {
               this.assistantMessageTexts.set(messageId, nextText);
               state.lastAssistantMessageId = messageId;
               state.lastAssistantText = nextText;
+              state.lastAssistantTextAt = now;
               updateDbLastAssistantText(sessionId, nextText);
             } else if (text) {
               state.lastAssistantText = text;
+              state.lastAssistantTextAt = now;
               updateDbLastAssistantText(sessionId, text);
             }
+          }
+          if (isUserSubmissionEvent(eventType, props, role)) {
+            const now = Date.now();
+            state.lastUserMessageAt = now;
+            state.lastActivityAt = now;
+            state.doneNotifiedAt = 0;
+          }
+          break;
+        }
+        case "tui.command.execute":
+        case "session.next.prompted":
+        case "session.next.prompt.admitted":
+        case "session.next.prompt.promoted": {
+          if (isUserSubmissionEvent(eventType, props)) {
+            const state = this.ensureState(sessionId);
+            const now = Date.now();
+            state.lastUserMessageAt = now;
+            state.lastActivityAt = now;
+            state.doneNotifiedAt = 0;
           }
           break;
         }
@@ -1035,6 +1084,10 @@ class SessionTracker {
     if (this.hasActiveToolsInTree(sessionId))
       return false;
     if (this.hasActiveChildren(sessionId))
+      return false;
+    if (!state.lastAssistantText || state.lastAssistantTextAt === 0)
+      return false;
+    if (state.lastAssistantTextAt <= state.lastUserMessageAt)
       return false;
     const treeLast = this.getTreeLastActivity(sessionId);
     if (now - treeLast < quiescenceMs)
@@ -1357,13 +1410,30 @@ class HermesRelayRuntime {
           break;
         }
         case "message.updated": {
-          const role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
-          if (role === "user") {
+          const role = getMessageRole(props);
+          if (isUserSubmissionEvent(eventType, props, role)) {
             this.sessionTracker.resetDoneNotified(sessionId);
           }
           break;
         }
         case "message.part.updated": {
+          const messageId = getStringProp(props, "messageID") ?? getNestedStringProp(props, "part", "messageID");
+          let role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
+          if (!role && messageId) {
+            role = this.sessionTracker.messageRoles.get(messageId);
+          }
+          if (isUserSubmissionEvent(eventType, props, role)) {
+            this.sessionTracker.resetDoneNotified(sessionId);
+          }
+          break;
+        }
+        case "tui.command.execute":
+        case "session.next.prompted":
+        case "session.next.prompt.admitted":
+        case "session.next.prompt.promoted": {
+          if (isUserSubmissionEvent(eventType, props)) {
+            this.sessionTracker.resetDoneNotified(sessionId);
+          }
           break;
         }
         case "permission.asked":
