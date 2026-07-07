@@ -893,7 +893,6 @@ class SessionTracker {
           if (role === "assistant" && partType === "text") {
             state.lastAssistantMessageAt = Date.now();
             state.lastActivityAt = Date.now();
-            state.doneNotifiedAt = 0;
             const text = getStringProp(props, "text") ?? getNestedStringProp(props, "part", "text");
             if (text && messageId) {
               const previousText = this.assistantMessageTexts.get(messageId) ?? "";
@@ -1365,10 +1364,6 @@ class HermesRelayRuntime {
           break;
         }
         case "message.part.updated": {
-          const role = getStringProp(props, "role") ?? getNestedStringProp(props, "info", "role");
-          if (role === "assistant") {
-            this.sessionTracker.resetDoneNotified(sessionId);
-          }
           break;
         }
         case "permission.asked":
@@ -1381,7 +1376,6 @@ class HermesRelayRuntime {
       this.recomputeQuiescenceTimer(sessionId);
       if (eventType === "session.deleted") {
         for (const parentId of parentChain) {
-          this.sessionTracker.resetDoneNotified(parentId);
           this.recomputeQuiescenceTimer(parentId);
         }
       } else {
@@ -1390,7 +1384,6 @@ class HermesRelayRuntime {
           const ancestorState = this.sessionTracker.getState(ancestorId);
           const parentId = ancestorState?.parentId;
           if (parentId) {
-            this.sessionTracker.resetDoneNotified(parentId);
             this.recomputeQuiescenceTimer(parentId);
           }
           ancestorId = parentId;
