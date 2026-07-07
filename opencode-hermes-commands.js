@@ -542,7 +542,7 @@ function loadConfig() {
     telegramBotToken: parseString(process.env.HERMES_TELEGRAM_BOT_TOKEN, process.env.TELEGRAM_BOT_TOKEN),
     telegramChatId: parseString(process.env.HERMES_TELEGRAM_CHAT_ID, process.env.TELEGRAM_HOME_CHANNEL),
     maxPerHour: parseIntDefault(process.env.HERMES_RELAY_MAX_PER_HOUR, 10),
-    quiescenceMs: parseIntDefault(process.env.HERMES_RELAY_QUIESCENCE_MS, 300000),
+    quiescenceMs: 0,
     sendTimeoutMs: parseIntDefault(process.env.HERMES_RELAY_SEND_TIMEOUT_MS, 5000),
     maxAttempts: parseIntDefault(process.env.HERMES_RELAY_MAX_ATTEMPTS, 4),
     retryDelays: parseIntArray(process.env.HERMES_RELAY_RETRY_DELAYS, [30000, 120000, 300000])
@@ -612,9 +612,8 @@ class Scheduler {
     this.timer = setTimeout(() => {
       this.drain().catch(() => {});
     }, delay);
-    if (typeof this.timer.unref === "function") {
-      this.timer.unref();
-    }
+    // Keep the timer referenced so short-lived `opencode run` processes do not
+    // exit before a just-enqueued completion notification is delivered.
   }
   async drain() {
     if (!this.running)
@@ -1029,7 +1028,7 @@ class SessionTracker {
       return false;
     if (state.isChild && !includeChildren)
       return false;
-    const statusAllowsDone = state.status === "idle" || !!state.lastAssistantText;
+    const statusAllowsDone = state.status === "idle";
     if (!statusAllowsDone)
       return false;
     if (this.hasPendingInTree(sessionId))
@@ -1420,7 +1419,7 @@ class HermesRelayRuntime {
         return;
       if (state.deleted)
         return;
-      if (state.status !== "idle" && !state.lastAssistantText)
+      if (state.status !== "idle")
         return;
       if (state.pendingPermission || state.pendingQuestion)
         return;
